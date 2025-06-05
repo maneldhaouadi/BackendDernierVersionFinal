@@ -366,6 +366,27 @@ async getStockHealth() {
   async findAllPaginated(@Query() query: IQueryObject): Promise<PageDto<ResponseArticleDto>> {
     return await this.articleService.findAllPaginated(query);
   }
+
+
+  @Put(':id/update-stock')
+  @ApiOperation({ summary: 'Mettre à jour le stock d\'un article' })
+  @ApiParam({ name: 'id', description: 'ID de l\'article', type: Number })
+  @ApiBody({
+    description: 'Changement de quantité (positif pour ajouter, négatif pour retirer)',
+    schema: {
+      type: 'object',
+      properties: {
+        quantityChange: { type: 'number', description: 'Changement de quantité' }
+      }
+    }
+  })
+  async updateArticleStock(
+    @Param('id', ParseIntPipe) id: number,
+    @Body('quantityChange', ParseIntPipe) quantityChange: number
+  ): Promise<ResponseArticleDto> {
+    const updatedArticle = await this.articleService.updateArticleStock(id, quantityChange);
+    return this.mapToResponseDto(updatedArticle);
+  }
   
 // article.controller.ts
 @Get('/list/active')

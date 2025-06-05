@@ -101,11 +101,11 @@ export class ArticleExpensQuotationEntryService {
                 article.unitPrice = createArticleExpensQuotationEntryDto.unit_price;
             }
 
-           await this.articleService.update(article.id, {
-    reference: article.reference,  // Include the reference
-    quantityInStock: article.quantityInStock,
-    unitPrice: article.unitPrice
-});
+            await this.articleService.update(article.id, {
+                reference: article.reference,
+                quantityInStock: article.quantityInStock,
+                unitPrice: article.unitPrice
+            });
         }
         // CAS 2: Nouvel article à créer ou article existant par référence
         else {
@@ -132,12 +132,21 @@ export class ArticleExpensQuotationEntryService {
                     article.unitPrice = createArticleExpensQuotationEntryDto.unit_price;
                 }
 
-               await this.articleService.update(article.id, {
-    reference: article.reference,  // Include the reference
-    quantityInStock: article.quantityInStock,
-    unitPrice: article.unitPrice
-});
+                await this.articleService.update(article.id, {
+                    reference: article.reference,
+                    quantityInStock: article.quantityInStock,
+                    unitPrice: article.unitPrice
+                });
             } else {
+                // Avant de créer un nouvel article, vérifier si la référence existe déjà dans la base de données
+                const allArticlesWithSameRef = await this.articleService.findAllByReference(
+                    createArticleExpensQuotationEntryDto.reference
+                );
+
+                if (allArticlesWithSameRef && allArticlesWithSameRef.length > 0) {
+                    throw new Error(`Un article avec la référence ${createArticleExpensQuotationEntryDto.reference} existe déjà dans la base de données`);
+                }
+
                 // Création d'un nouvel article
                 if (!articleTitle) {
                     throw new Error('Le titre de l\'article est obligatoire pour créer un nouvel article');

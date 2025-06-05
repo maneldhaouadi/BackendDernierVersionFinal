@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { ArticleHistoryEntity } from '../repositories/entities/article-history.entity';
 import { ArticleHistoryRepository } from '../repositories/repository/article-history.repository';
 import { PdfService } from 'src/common/pdf/services/pdf.service';
@@ -109,13 +109,27 @@ async getActiveVersion(articleId: number): Promise<ArticleHistoryEntity | null> 
 async createHistoryEntry(historyData: {
   version: number;
   changes: Record<string, { oldValue: any; newValue: any }>;
-  articleId: number;
+  articleId: number; // S'assurer que c'est toujours un nombre
 }): Promise<ArticleHistoryEntity> {
+  // Validation de l'articleId
+  if (!historyData.articleId || isNaN(historyData.articleId)) {
+    throw new BadRequestException('articleId must be a valid number');
+  }
+
   const queryRunner = this.dataSource.createQueryRunner();
   await queryRunner.connect();
   await queryRunner.startTransaction();
 
   try {
+    // Vérifier que l'article existe
+    const articleExists = await queryRunner.manager.findOne(ArticleEntity, {
+      where: { id: historyData.articleId }
+    });
+    
+    if (!articleExists) {
+      throw new NotFoundException(`Article with ID ${historyData.articleId} not found`);
+    }
+
     // Désactiver toutes les versions précédentes
     await queryRunner.manager.update(
       ArticleHistoryEntity,

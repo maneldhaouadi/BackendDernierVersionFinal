@@ -155,6 +155,49 @@ async unarchiveArticle(id: number): Promise<ArticleEntity> {
     return result;
   }
 
+
+  async updateArticleStock(
+    id: number,
+    quantityChange: number
+  ): Promise<ArticleEntity> {
+    // 1. Trouver l'article existant
+    const article = await this.findOneById(id);
+    
+    // 2. Vérifier que la quantité ne deviendra pas négative
+    const newQuantity = article.quantityInStock + quantityChange;
+    if (newQuantity < 0) {
+      throw new BadRequestException(
+        `La quantité ne peut pas devenir négative. Stock actuel: ${article.quantityInStock}, changement demandé: ${quantityChange}`
+      );
+    }
+
+    // 3. Préparer les données de mise à jour
+    const updatePayload: Partial<ArticleEntity> = {
+      quantityInStock: newQuantity,
+      version: article.version + 1,
+      updatedAt: new Date()
+    };
+
+    // 4. Gérer l'historique des modifications
+    const changes = this.getChanges(article, updatePayload);
+    if (Object.keys(changes).length > 0) {
+      await this.articleHistoryService.createHistoryEntry({
+        version: updatePayload.version,
+        changes,
+        articleId: id
+      });
+    }
+
+    // 5. Appliquer la mise à jour
+    await this.articleRepository.update(id, updatePayload);
+    
+    // 6. Retourner l'article mis à jour
+    return this.articleRepository.findOne({ 
+      where: { id },
+      relations: ['history'] 
+    });
+  }
+  
   async updateStatus(id: number, newStatus: ArticleStatus): Promise<ArticleEntity> {
     const article = await this.findOneById(id);
     
@@ -517,6 +560,21 @@ async findOneByReference(reference: string): Promise<ArticleEntity | null> {
       return null;
     }
   }
+  async findAllByReference(reference: string): Promise<ArticleEntity[]> {
+  if (!reference) {
+    return [];
+  }
+  
+  try {
+    return await this.articleRepository.find({ 
+      where: { reference: ILike(`%${reference}%`) },
+      relations: ['history']
+    });
+  } catch (error) {
+    console.error('Error finding articles by reference:', error);
+    return [];
+  }
+}
    async checkArticleAvailability(articleId: number, requestedQuantity: number): Promise<{
     available: boolean;
     availableQuantity: number;

@@ -155,7 +155,11 @@ export class DialogflowService {
     this.PROJECT_ID,
     sessionId
   );
-   const exactQuotationPhrases = [
+
+  
+
+  // Phrases exactes pour la création de devis
+  const exactQuotationPhrases = [
     'je veux créer une quotation',
     'crée une quotation',
     'nouvelle quotation',
@@ -163,7 +167,8 @@ export class DialogflowService {
     'je souhaite créer une quotation'
   ].map(phrase => phrase.toLowerCase().trim().replace(/\s+/g, ' '));
 
- const normalizeInput = (text: string) => {
+  // Normalisation du texte d'entrée
+  const normalizeInput = (text: string) => {
     return text
       .toLowerCase()
       .normalize("NFD") // Séparation des accents
@@ -172,17 +177,12 @@ export class DialogflowService {
       .replace(/\s+/g, ' ');
   };
 
-  // 3. Nettoyage et vérification
-const cleanedInput = normalizeInput(queryText);
+  
+  const cleanedInput = normalizeInput(queryText);
   const isQuotationRequest = exactQuotationPhrases.includes(cleanedInput);
 
-
-if (isQuotationRequest) {
-    // Ici vous pouvez soit:
-    // a) Retourner directement la réponse de création
-    // b) Laisser Dialogflow gérer le flux normal
-
-    // Solution recommandée (a):
+  // 1. Gestion des requêtes de création de devis exactes
+  if (isQuotationRequest) {
     return {
       fulfillmentText: "Commençons la création de votre devis. Veuillez fournir le numéro séquentiel du devis :",
       outputContexts: [
@@ -202,16 +202,13 @@ if (isQuotationRequest) {
     };
   }
 
-  // 3. Vérification ultra-stricte pour les requêtes de quotation
+  // 2. Vérification stricte pour les requêtes contenant "quotation"
   const containsQuotationWord = /\bquotation\b/i.test(queryText);
-  
   if (containsQuotationWord) {
-    // Vérifie si la phrase correspond exactement à une des phrases autorisées
     const isExactMatch = exactQuotationPhrases.some(
       phrase => cleanedInput === phrase
     );
 
-    // Vérifie aussi s'il y a des caractères supplémentaires après "quotation"
     const hasExtraCharsAfterQuotation = 
       !/\bquotation\b$/i.test(queryText.trim()) && 
       /\bquotation[a-z]*\b/i.test(queryText);
@@ -226,9 +223,8 @@ if (isQuotationRequest) {
     }
   }
 
-  
-  // 1. Vérifier l'historique
- const existingHistory = await this.historyRepository.getFullHistory(sessionId);
+  // 3. Gestion des requêtes d'historique
+  const existingHistory = await this.historyRepository.getFullHistory(sessionId);
   const isHistoryRequest = 
     queryText.toLowerCase().includes('history') || 
     queryText.toLowerCase().includes('historique') ||
@@ -247,20 +243,21 @@ if (isQuotationRequest) {
     return response;
   }
 
-  // 2. Extraire les numéros de documents d'abord
+  // 4. Extraction des numéros de documents
   const invoiceNumber = this.extractInvoiceNumber(queryText);
   const quotationNumber = this.extractQuotationNumber(queryText);
 
-  if (quotationNumber && !this.isValidQuotationFormat(quotationNumber)) {
-    const errorMessage = t('invalidQuotationFormat');
-    await this.saveToHistory(sessionId, queryText, errorMessage);
-    return {
-      fulfillmentText: errorMessage,
-      outputContexts: []
-    };
+  // Validation du format du numéro de devis
+  if (quotationNumber) {
+  // Ajout d'une vérification de la langue pour la réponse
+  if (lang === 'en' && queryText.toLowerCase().includes('status')) {
+    const response = await this.handleQuotationStatus(quotationNumber, lang, sessionId);
+    await this.saveToHistory(sessionId, queryText, response.fulfillmentText);
+    return response;
   }
+}
 
-  // 3. Détection des comparaisons - PRIORITAIRE
+  // 5. Gestion des requêtes de comparaison
   if (this.isComparisonRequest(queryText)) {
     const comparisonParams = {
       data_type: invoiceNumber ? 'facture' : 'devis',
@@ -283,7 +280,7 @@ if (isQuotationRequest) {
     }
   }
 
-  // 4. Traitement normal des documents si pas de comparaison
+  // 6. Gestion des statuts de documents
   if (invoiceNumber) {
     const response = await this.handleInvoiceStatus(invoiceNumber, lang, sessionId);
     await this.saveToHistory(sessionId, queryText, response.fulfillmentText);
@@ -296,7 +293,7 @@ if (isQuotationRequest) {
     return response;
   }
 
-  // 5. Préparation de la requête Dialogflow standard
+  // 7. Préparation de la requête Dialogflow standard
   const historyContent = existingHistory.entries.length > 0 
     ? existingHistory.entries
         .map(e => `User: ${e.user}\nBot: ${e.bot}`)
@@ -329,7 +326,7 @@ if (isQuotationRequest) {
 
     // Vérification du score de confiance et de l'intention fallback
     if (result.intent?.displayName === 'Default Fallback Intent' || 
-        result.intentDetectionConfidence < 0.5) { // Seuil de confiance abaissé à 0.5
+        result.intentDetectionConfidence < 0.5) {
       return {
         fulfillmentText: t.fallback,
         intent: 'Default_Fallback_Intent',
@@ -338,82 +335,115 @@ if (isQuotationRequest) {
       };
     }
 
-    // Traitement des intents spécifiques
-    if (result.intent?.displayName === 'AddQuotationArticle' && result.allRequiredParamsPresent) {
-      const params = result.parameters.fields;
-      const discountType = params.discountType?.stringValue?.toUpperCase() === 'AMMOUNT' 
-        ? DISCOUNT_TYPES.AMOUNT 
-        : DISCOUNT_TYPES.PERCENTAGE;
+    if (result.intent?.displayName === 'FAQ_Quotation' && 
+    result.parameters.fields['quotation_number']) {
+  // Use Dialogflow's extracted parameter
+  const quotationNumber = result.parameters.fields['quotation_number'].stringValue;
+  return this.handleQuotationStatus(quotationNumber, lang, sessionId);
+}
+// Après la partie FAQ_Quotation, ajoutez ce bloc pour les factures
+if (result.intent?.displayName === 'FAQ_Invoice' && 
+    result.parameters.fields['invoice_number']) {
+  // Utiliser le paramètre extrait par Dialogflow
+  const invoiceNumber = result.parameters.fields['invoice_number'].stringValue;
+  return this.handleInvoiceStatus(invoiceNumber, lang, sessionId);
+}
 
-      const addResult = await this.addArticleToQuotation({
-        quotationNumber: params.quotationNumber?.stringValue,
-        articleId: params.articleId.numberValue,
-        quantity: params.quantity.numberValue,
-        discount: params.discount?.numberValue || 0,
-        discount_type: discountType,
-        unit_price: params.unitPrice?.numberValue
-      }, lang);
+// Sinon procéder à l'extraction personnalisée
+const customInvoiceNumber = this.extractInvoiceNumber(queryText);
+if (customInvoiceNumber) {
+  return this.handleInvoiceStatus(customInvoiceNumber, lang, sessionId);
+}
 
-      await this.saveToHistory(sessionId, queryText, addResult.message);
-      return {
-        fulfillmentText: addResult.message,
-        intent: result.intent.displayName,
-        parameters: result.parameters,
-        outputContexts: result.outputContexts,
-        allRequiredParamsPresent: true
-      };
-    }
+// Otherwise proceed with your custom extraction
+const customQuotationNumber = this.extractQuotationNumber(queryText);
+if (customQuotationNumber) {
+  return this.handleQuotationStatus(customQuotationNumber, lang, sessionId);
+}
 
-    if (result.intent?.displayName === 'CreateQuotation' && result.allRequiredParamsPresent) {
-      try {
-        const params = result.parameters.fields;
-        const articles = [];
-        const articleId = params.articleId?.numberValue;
 
-        if (articleId !== undefined) {
-          const articleInfo = await this.getArticleInfo(articleId, lang);
-          if (!articleInfo) {
-            throw new Error(t.articleNotFound.replace('{{id}}', articleId.toString()));
-          }
+    // Gestion des intents spécifiques
+    switch (result.intent?.displayName) {
+      case 'AddQuotationArticle':
+        if (result.allRequiredParamsPresent) {
+          const params = result.parameters.fields;
+          const discountType = params.discountType?.stringValue?.toUpperCase() === 'AMMOUNT' 
+            ? DISCOUNT_TYPES.AMOUNT 
+            : DISCOUNT_TYPES.PERCENTAGE;
 
-          articles.push({
-            articleId: articleId,
-            quantity: params.quantity?.numberValue || 1,
+          const addResult = await this.addArticleToQuotation({
+            quotationNumber: params.quotationNumber?.stringValue,
+            articleId: params.articleId.numberValue,
+            quantity: params.quantity.numberValue,
             discount: params.discount?.numberValue || 0,
-            discount_type: params.discount_type?.stringValue as DISCOUNT_TYPES || DISCOUNT_TYPES.PERCENTAGE,
-            unit_price: articleInfo.unitPrice
-          });
+            discount_type: discountType,
+            unit_price: params.unitPrice?.numberValue
+          }, lang);
+
+          await this.saveToHistory(sessionId, queryText, addResult.message);
+          return {
+            fulfillmentText: addResult.message,
+            intent: result.intent.displayName,
+            parameters: result.parameters,
+            outputContexts: result.outputContexts,
+            allRequiredParamsPresent: true
+          };
         }
+        break;
 
-        const creationResult = await this.createQuotation({
-          firmName: params.firmName.stringValue,
-          cabinetId: params.cabinetId?.numberValue || 1,
-          interlocutorName: params.interlocutorName.stringValue,
-          currencyId: params.currencyId?.numberValue,
-          object: params.object?.stringValue || `${t.quotation} ${new Date().toLocaleDateString(lang)}`,
-          sequentialNumbr: params.sequentialNumbr?.stringValue,
-          articles: articles,
-          status: this.mapStatusStringToEnum(params.status?.stringValue),
-          dueDate: params.duedate?.stringValue ? new Date(params.duedate.stringValue) : undefined,
-          date: params.date?.stringValue ? new Date(params.date.stringValue) : new Date()
-        }, lang, sessionId, queryText);
+      case 'CreateQuotation':
+        if (result.allRequiredParamsPresent) {
+          try {
+            const params = result.parameters.fields;
+            const articles = [];
+            const articleId = params.articleId?.numberValue;
 
-        await this.saveToHistory(sessionId, queryText, creationResult.message);
-        return {
-          fulfillmentText: creationResult.message,
-          intent: result.intent.displayName,
-          parameters: result.parameters,
-          outputContexts: result.outputContexts,
-          allRequiredParamsPresent: true
-        };
-      } catch (error) {
-        console.error('Error in CreateQuotation intent:', error);
-        await this.saveToHistory(sessionId, queryText, `${t.creationError}: ${error.message}`);
-        return {
-          fulfillmentText: `${t.creationError}: ${error.message}`,
-          outputContexts: []
-        };
-      }
+            if (articleId !== undefined) {
+              const articleInfo = await this.getArticleInfo(articleId, lang);
+              if (!articleInfo) {
+                throw new Error(t.articleNotFound.replace('{{id}}', articleId.toString()));
+              }
+
+              articles.push({
+                articleId: articleId,
+                quantity: params.quantity?.numberValue || 1,
+                discount: params.discount?.numberValue || 0,
+                discount_type: params.discount_type?.stringValue as DISCOUNT_TYPES || DISCOUNT_TYPES.PERCENTAGE,
+                unit_price: articleInfo.unitPrice
+              });
+            }
+
+            const creationResult = await this.createQuotation({
+              firmName: params.firmName.stringValue,
+              cabinetId: params.cabinetId?.numberValue || 1,
+              interlocutorName: params.interlocutorName.stringValue,
+              currencyId: params.currencyId?.numberValue,
+              object: params.object?.stringValue || `${t.quotation} ${new Date().toLocaleDateString(lang)}`,
+              sequentialNumbr: params.sequentialNumbr?.stringValue,
+              articles: articles,
+              status: this.mapStatusStringToEnum(params.status?.stringValue),
+              dueDate: params.duedate?.stringValue ? new Date(params.duedate.stringValue) : undefined,
+              date: params.date?.stringValue ? new Date(params.date.stringValue) : new Date()
+            }, lang, sessionId, queryText);
+
+            await this.saveToHistory(sessionId, queryText, creationResult.message);
+            return {
+              fulfillmentText: creationResult.message,
+              intent: result.intent.displayName,
+              parameters: result.parameters,
+              outputContexts: result.outputContexts,
+              allRequiredParamsPresent: true
+            };
+          } catch (error) {
+            console.error('Error in CreateQuotation intent:', error);
+            await this.saveToHistory(sessionId, queryText, `${t.creationError}: ${error.message}`);
+            return {
+              fulfillmentText: `${t.creationError}: ${error.message}`,
+              outputContexts: []
+            };
+          }
+        }
+        break;
     }
 
     // Réponse par défaut pour les autres intentions
@@ -436,23 +466,22 @@ if (isQuotationRequest) {
   }
 }
   private extractComparisonValue(text: string): string | number | null {
-    // Détection des valeurs entre guillemets (pour le statut)
-    const quotedMatch = text.match(/['"]([^'"]+)['"]/);
-    if (quotedMatch) return quotedMatch[1].toLowerCase();
-    
-    // Détection des valeurs booléennes
-    if (text.includes('payé') || text.includes('paid')) return 'paid';
-    if (text.includes('non payé') || text.includes('unpaid')) return 'unpaid';
-    
-    // Détection spécifique des montants après "montant de" ou "amount of"
-    const amountPattern = /(?:montant|amount)\s*(?:de|of)?\s*(\d+[\.,]?\d*)/i;
-    const amountMatch = text.match(amountPattern);
-    if (amountMatch) return parseFloat(amountMatch[1].replace(',', '.'));
-    
-    // Détection générique des nombres (fallback)
-    const genericNumberMatch = text.match(/(\d+[\.,]?\d*)/);
-    return genericNumberMatch ? parseFloat(genericNumberMatch[0].replace(',', '.')) : null;
-  }
+  // Détection spécifique des montants avec le symbole €
+  const euroAmountMatch = text.match(/(\d+[\.,]?\d*)\s*€/i);
+  if (euroAmountMatch) return parseFloat(euroAmountMatch[1].replace(',', '.'));
+
+  // Détection des valeurs entre guillemets (pour le statut)
+  const quotedMatch = text.match(/['"]([^'"]+)['"]/);
+  if (quotedMatch) return quotedMatch[1].toLowerCase();
+  
+  // Détection des valeurs booléennes
+  if (text.includes('payé') || text.includes('paid')) return 'paid';
+  if (text.includes('non payé') || text.includes('unpaid')) return 'unpaid';
+  
+  // Détection générique des nombres (fallback)
+  const genericNumberMatch = text.match(/(\d+[\.,]?\d*)/);
+  return genericNumberMatch ? parseFloat(genericNumberMatch[0].replace(',', '.')) : null;
+}
   // Méthodes utilitaires ajoutées
   private extractDataType(text: string): string {
     return text.includes('devis') ? 'devis' : 
@@ -660,38 +689,35 @@ private async handleQuotationStatus(
 ): Promise<any> {
   const t = this.getTranslation(lang);
   
-  // Validation stricte du format avant traitement
-  if (!this.isValidQuotationFormat(quotationNumber)) {
-    const errorMessage = t('invalidQuotationFormat');
-    await this.saveToHistory(sessionId, `Status request for ${quotationNumber}`, errorMessage);
-    return {
-      fulfillmentText: errorMessage,
-      outputContexts: []
-    };
-  }
-
   try {
     const quotationStatus = await this.getQuotationStatus(quotationNumber);
     
     if (!quotationStatus) {
-      const response = {
+      return {
         fulfillmentText: t.notFound(t.quotation, quotationNumber),
+        intent: 'FAQ_Quotation',
+        allRequiredParamsPresent: true,
         outputContexts: []
       };
-      await this.saveToHistory(sessionId, `Status request for ${quotationNumber}`, response.fulfillmentText);
-      return response;
     }
 
     const statusMessage = this.getQuotationStatusMessage(quotationStatus.status, lang);
     const amount = this.formatCurrency(quotationStatus.details?.amount || 0, lang);
     const date = this.formatDate(quotationStatus.details?.date?.toISOString(), lang);
 
-    const fulfillmentText = lang === 'fr' 
-      ? `Statut du devis ${quotationNumber}: ${statusMessage}\nMontant total: ${amount}\nDate de création: ${date}`
-      : `Status of quotation ${quotationNumber}: ${statusMessage}\nTotal amount: ${amount}\nCreation date: ${date}`;
+    let fulfillmentText;
+    if (lang === 'fr') {
+      fulfillmentText = `Statut du devis ${quotationNumber}: ${statusMessage}\nMontant total: ${amount}\nDate de création: ${date}`;
+    } else if (lang === 'es') {
+      fulfillmentText = `Estado del presupuesto ${quotationNumber}: ${statusMessage}\nMonto total: ${amount}\nFecha de creación: ${date}`;
+    } else {
+      fulfillmentText = `Status of quotation ${quotationNumber}: ${statusMessage}\nTotal amount: ${amount}\nCreation date: ${date}`;
+    }
 
-    const response = {
+    return {
       fulfillmentText,
+      intent: 'FAQ_Quotation',
+      allRequiredParamsPresent: true,
       outputContexts: [{
         name: `projects/${this.PROJECT_ID}/agent/sessions/${sessionId}/contexts/quotation-status`,
         lifespanCount: 5,
@@ -703,27 +729,23 @@ private async handleQuotationStatus(
         }
       }]
     };
-
-    await this.saveToHistory(sessionId, `Status request for ${quotationNumber}`, fulfillmentText);
-    return response;
   } catch (error) {
     console.error('Error handling quotation status:', error);
-    const response = {
+    return {
       fulfillmentText: t.error,
+      intent: 'FAQ_Quotation',
+      allRequiredParamsPresent: false,
       outputContexts: []
     };
-    await this.saveToHistory(sessionId, `Status request for ${quotationNumber}`, response.fulfillmentText);
-    return response;
   }
 }
   
 private extractQuotationNumber(text: string): string | null {
-  // Pattern strict pour QUO- suivi de 6 chiffres exactement
-  const strictPattern = /(?:quotation|devis|presupuesto)\s+(QUO-\d{6})\b/i;
-  const match = text.match(strictPattern);
-  return match ? match[1].toUpperCase() : null;
+  // More flexible pattern that matches QUO- followed by digits
+  const pattern = /(?:quotation|devis|presupuesto|quote|purchase\s+quotation)\s*(?:no|num|number)?\s*[:#]?\s*(QUO-\d+)|(QUO-\d+)/i;
+  const match = text.match(pattern);
+  return match ? (match[1] || match[2]).toUpperCase() : null;
 }
-
 private isValidQuotationFormat(quotationNumber: string): boolean {
   // Vérifie que le numéro commence par QUO- suivi de exactement 6 chiffres
   return /^QUO-\d{6}$/i.test(quotationNumber);
@@ -731,70 +753,93 @@ private isValidQuotationFormat(quotationNumber: string): boolean {
  
 
   private extractInvoiceNumber(text: string): string | null {
-    const patterns = [
-      /(?:invoice|facture)\s+(INV-\d+)/i,
-      /(?:numero|num|#)\s+(INV-\d+)/i,
-      /(?:status|statut)\s+(?:of|pour)?\s*(?:invoice|facture)?\s*(?:no|num|number)?\s*[:#]?\s*(INV-\d+)/i,
-      /^(INV-\d+)$/i
-    ];
-  
-    for (const pattern of patterns) {
-      const match = text.match(pattern);
-      if (match && match[1]) {
-        return match[1].toUpperCase();
-      }
+  // Patterns plus complets pour détecter les numéros de facture
+  const patterns = [
+    /(?:invoice|facture|factura)\s+(?:no|num|number)?\s*[:#]?\s*(INV-\d+)/i,
+    /(?:status|statut|estado)\s+(?:of|pour|de)?\s*(?:invoice|facture|factura)?\s*(?:no|num|number)?\s*[:#]?\s*(INV-\d+)/i,
+    /^(INV-\d+)$/i,
+    /(INV-\d+)/i
+  ];
+
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (match && match[1]) {
+      return match[1].toUpperCase();
     }
-    return null;
   }
+  return null;
+}
 
   private async handleInvoiceStatus(
-    invoiceNumber: string,
-    lang: string,
-    sessionId: string
-  ): Promise<any> {
-    const t = this.getTranslation(lang);
-    
-    try {
-      const invoiceStatus = await this.getInvoiceStatus(invoiceNumber);
-      
-      if (!invoiceStatus) {
-        return {
-          fulfillmentText: t.notFound(t.invoice, invoiceNumber),
-          outputContexts: []
-        };
-      }
+  invoiceNumber: string,
+  lang: string,
+  sessionId: string
+): Promise<any> {
+  const t = this.getTranslation(lang);
   
-      const statusMessage = this.getInvoiceStatusMessage(invoiceStatus.status, lang);
-      const amount = this.formatCurrency(invoiceStatus.details?.amount || 0, lang);
-      const paidAmount = this.formatCurrency(invoiceStatus.details?.paidAmount || 0, lang);
-      const dueDate = this.formatDate(invoiceStatus.details?.dueDate, lang);
-  
-      const fulfillmentText = lang === 'fr' 
-        ? `Statut de la facture ${invoiceNumber}: ${statusMessage}\nMontant: ${amount}\nMontant payé: ${paidAmount}\nDate d'échéance: ${dueDate}`
-        : `Status of invoice ${invoiceNumber}: ${statusMessage}\nAmount: ${amount}\nPaid amount: ${paidAmount}\nDue date: ${dueDate}`;
-  
+  try {
+    // Validation du numéro de facture
+    if (!invoiceNumber || !invoiceNumber.startsWith('INV-')) {
       return {
-        fulfillmentText,
-        outputContexts: [{
-          name: `projects/${this.PROJECT_ID}/agent/sessions/${sessionId}/contexts/invoice-status`,
-          lifespanCount: 5,
-          parameters: {
-            invoiceNumber,
-            status: invoiceStatus.status,
-            amount: invoiceStatus.details?.amount,
-            paidAmount: invoiceStatus.details?.paidAmount,
-            dueDate: invoiceStatus.details?.dueDate
-          }
-        }]
-      };
-    } catch (error) {
-      console.error('Error handling invoice status:', error);
-      return {
-        fulfillmentText: t.error,
+        fulfillmentText: t.missingNumber(t.invoice),
         outputContexts: []
       };
     }
+
+    const invoiceStatus = await this.getInvoiceStatus(invoiceNumber);
+    
+    if (!invoiceStatus) {
+      return {
+        fulfillmentText: t.notFound(t.invoice, invoiceNumber),
+        intent: 'FAQ_Invoice',
+        allRequiredParamsPresent: true,
+        outputContexts: []
+      };
+    }
+
+    const statusMessage = this.getInvoiceStatusMessage(invoiceStatus.status, lang);
+    const amount = this.formatCurrency(invoiceStatus.details?.amount || 0, lang);
+    const paidAmount = this.formatCurrency(invoiceStatus.details?.paidAmount || 0, lang);
+    const dueDate = this.formatDate(invoiceStatus.details?.dueDate, lang);
+
+    let fulfillmentText;
+    switch(lang) {
+      case 'fr':
+        fulfillmentText = `Statut de la facture ${invoiceNumber}: ${statusMessage}\nMontant: ${amount}\nMontant payé: ${paidAmount}\nDate d'échéance: ${dueDate}`;
+        break;
+      case 'es':
+        fulfillmentText = `Estado de la factura ${invoiceNumber}: ${statusMessage}\nMonto: ${amount}\nMonto pagado: ${paidAmount}\nFecha de vencimiento: ${dueDate}`;
+        break;
+      default:
+        fulfillmentText = `Status of invoice ${invoiceNumber}: ${statusMessage}\nAmount: ${amount}\nPaid amount: ${paidAmount}\nDue date: ${dueDate}`;
+    }
+
+    return {
+      fulfillmentText,
+      intent: 'FAQ_Invoice',
+      allRequiredParamsPresent: true,
+      outputContexts: [{
+        name: `projects/${this.PROJECT_ID}/agent/sessions/${sessionId}/contexts/invoice-status`,
+        lifespanCount: 5,
+        parameters: {
+          invoiceNumber,
+          status: invoiceStatus.status,
+          amount: invoiceStatus.details?.amount,
+          paidAmount: invoiceStatus.details?.paidAmount,
+          dueDate: invoiceStatus.details?.dueDate
+        }
+      }]
+    };
+  } catch (error) {
+    console.error('Error handling invoice status:', error);
+    return {
+      fulfillmentText: t.error,
+      intent: 'FAQ_Invoice',
+      allRequiredParamsPresent: false,
+      outputContexts: []
+    };
   }
+}
 
   public async getQuotationStatus(sequentialNumber: string): Promise<{ 
     quotationNumber: string, 
@@ -1478,7 +1523,7 @@ private async handleDataComparison(
     if (!document) {
       return {
         success: false,
-        message: t('documentNotFound', { reference: params.reference_id })
+        message: t.documentNotFound.replace('{reference}', params.reference_id)
       };
     }
 
@@ -1486,7 +1531,7 @@ private async handleDataComparison(
     if (params.user_value === null || params.user_value === undefined) {
       return {
         success: false,
-        message: t('fieldNotFound', { field: params.field_name })
+        message: t.fieldNotFound.replace('{field}', params.field_name)
       };
     }
 
@@ -1500,15 +1545,32 @@ private async handleDataComparison(
     if (dbValue === undefined) {
       return {
         success: false,
-        message: t('fieldNotFound', { field: params.field_name })
+        message: t.fieldNotFound.replace('{field}', params.field_name)
       };
     }
 
-    const comparison = Number(params.user_value) === dbValue ? 'equal' : 
-                      Number(params.user_value) > dbValue ? 'greater' : 'less';
+    // Convertir en nombres pour la comparaison
+    const userValueNum = typeof params.user_value === 'string' 
+      ? parseFloat(params.user_value.replace(',', '.')) 
+      : params.user_value;
+    const dbValueNum = typeof dbValue === 'string' 
+      ? parseFloat(dbValue.replace(',', '.')) 
+      : dbValue;
 
-    const formattedDbValue = this.formatCurrency(dbValue, lang);
-    const formattedUserValue = this.formatCurrency(Number(params.user_value), lang);
+    if (isNaN(userValueNum) || isNaN(dbValueNum)) {
+      return {
+        success: false,
+        message: t.comparisonError
+      };
+    }
+
+    const epsilon = 0.01; // Tolérance pour les comparaisons de nombres à virgule
+    const isEqual = Math.abs(userValueNum - dbValueNum) < epsilon;
+    const comparison = isEqual ? 'equal' : 
+                      userValueNum > dbValueNum ? 'greater' : 'less';
+
+    const formattedDbValue = this.formatCurrency(dbValueNum, lang);
+    const formattedUserValue = this.formatCurrency(userValueNum, lang);
 
     let message = '';
     if (lang === 'fr') {
@@ -1518,6 +1580,13 @@ private async handleDataComparison(
       message += comparison === 'equal' 
         ? 'Les valeurs sont identiques.' 
         : `La valeur fournie est ${comparison === 'greater' ? 'supérieure' : 'inférieure'} à celle en base.`;
+    } else if (lang === 'es') {
+      message = `Comparación para ${document.sequentialNumbr} (${params.field_name}):\n`;
+      message += `- Valor proporcionado: ${formattedUserValue}\n`;
+      message += `- Valor en base: ${formattedDbValue}\n`;
+      message += comparison === 'equal' 
+        ? 'Los valores son idénticos.' 
+        : `El valor proporcionado es ${comparison === 'greater' ? 'superior' : 'inferior'} al valor en la base.`;
     } else {
       message = `Comparison for ${document.sequentialNumbr} (${params.field_name}):\n`;
       message += `- Provided value: ${formattedUserValue}\n`;
@@ -1536,7 +1605,7 @@ private async handleDataComparison(
     console.error('Comparison error:', error);
     return {
       success: false,
-      message: t('comparisonError')
+      message: t.comparisonError
     };
   }
 }
