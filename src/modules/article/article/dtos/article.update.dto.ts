@@ -2,6 +2,7 @@ import { ApiProperty } from '@nestjs/swagger';
 import { IsString, IsNumber, IsOptional, IsNotEmpty, Matches } from 'class-validator';
 import { ArticleStatus } from '../interfaces/article-data.interface';
 export class UpdateArticleDto {
+  
   @ApiProperty({ required: false })
   @IsString()
   @IsOptional()
@@ -15,7 +16,7 @@ export class UpdateArticleDto {
   @ApiProperty()
   @IsString()
   @IsNotEmpty()
-  reference: string;
+  reference?: string;
 
   @ApiProperty({ required: false })
   @IsNumber()

@@ -49,4 +49,9 @@ export class CreateArticleDto {
   @ApiProperty({ example: 999.99, type: Number })
   @IsNumber()
   unitPrice: number;
+  
+   @ApiProperty({ required: false })
+  @IsNumber()
+  @IsOptional()
+  id?: number; 
 }

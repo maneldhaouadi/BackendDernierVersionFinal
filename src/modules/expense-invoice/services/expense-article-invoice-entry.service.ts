@@ -4,7 +4,7 @@ import { InvoicingCalculationsService } from 'src/common/calculations/services/i
 import { LineItem } from 'src/common/calculations/interfaces/line-item.interface';
 import { IQueryObject } from 'src/common/database/interfaces/database-query-options.interface';
 import { QueryBuilder } from 'src/common/database/utils/database-query-builder';
-import { FindOneOptions } from 'typeorm';
+import { EntityManager, FindOneOptions, In } from 'typeorm';
 import { ExpenseArticleInvoiceEntryRepository } from '../repositories/repository/expense-invoice-article-entry.repository';
 import { ExpenseArticleInvoiceEntryTaxService } from './expense-article-invoice-entry-tax.service';
 import { ExpenseResponseArticleInvoiceEntryDto } from '../dtos/expense-article-invoice-entry.response.dto';
@@ -14,6 +14,9 @@ import { ExpenseUpdateArticleInvoiceEntryDto } from '../dtos/expense-article-inv
 import { ExpenseArticleInvoiceEntryNotFoundException } from '../errors/expense-article-invoice-entry.notfound.error';
 import { ArticleService } from 'src/modules/article/article/services/article.service';
 import { UpdateArticleDto } from 'src/modules/article/article/dtos/article.update.dto';
+import { ArticleEntity } from 'src/modules/article/article/repositories/entities/article.entity';
+import { ExpenseArticleInvoiceEntryTaxEntity } from '../repositories/entities/expense-article-invoice-entry-tax.entity';
+import { TaxEntity } from 'src/modules/tax/repositories/entities/tax.entity';
 
 @Injectable()
 export class ExpenseArticleInvoiceEntryService {
@@ -23,6 +26,8 @@ export class ExpenseArticleInvoiceEntryService {
     private readonly articleService: ArticleService,
     private readonly taxService: TaxService,
     private readonly calculationsService: InvoicingCalculationsService,
+     private readonly entityManager:EntityManager
+    
   ) {}
 
   async findOneByCondition(
@@ -160,45 +165,119 @@ export class ExpenseArticleInvoiceEntryService {
     return savedEntries;
   }
 
-  async update(
-    id: number,
-    updateDto: ExpenseUpdateArticleInvoiceEntryDto,
-  ): Promise<ExpenseArticleInvoiceEntryEntity> {
-    // 1. Récupérer l'entrée avec l'article
-    const existingEntry = await this.articleInvoiceEntryRepository.findOne({
-      where: { id },
-      relations: ['article'],
-      lock: { mode: "pessimistic_write" }
-    });
-  
-    if (!existingEntry?.article) {
-      throw new NotFoundException('Article entry or associated article not found');
-    }
-  
-    // 2. Mettre à jour TOUTES les propriétés de l'article
-    const articleUpdates: UpdateArticleDto = {
-      title: updateDto.article?.title ?? existingEntry.article.title,
-      description: updateDto.article?.description ?? existingEntry.article.description,
-      reference: updateDto.article?.reference ?? existingEntry.article.reference,
-      unitPrice: updateDto.unit_price ?? existingEntry.article.unitPrice,
-    };
-  
-    // 3. Sauvegarder l'article d'abord
-    const updatedArticle = await this.articleService.update(existingEntry.article.id, articleUpdates);
-  
-    // 4. Mettre à jour l'entrée de facture avec l'article fraîchement mis à jour
-    const updatedEntry = await this.articleInvoiceEntryRepository.save({
-      ...existingEntry,
-      quantity: updateDto.quantity ?? existingEntry.quantity,
-      unit_price: updateDto.unit_price ?? existingEntry.unit_price,
-      discount: updateDto.discount ?? existingEntry.discount,
-      discount_type: updateDto.discount_type ?? existingEntry.discount_type,
-      article: updatedArticle // Utilisez l'article mis à jour retourné par le service
-    });
-  
-    return updatedEntry;
-  }
-
+ async update(id: number, updateDto: Partial<ExpenseCreateArticleInvoiceEntryDto >){
+ {
+   return this.entityManager.transaction(async (transactionalEntityManager) => {
+     // 1. Récupérer l'entrée avec lock PESSIMISTIC_WRITE
+     const existingEntry = await transactionalEntityManager.findOne(
+       ExpenseArticleInvoiceEntryEntity,
+       {
+         where: { id },
+         relations: ['article'],
+         lock: { mode: "pessimistic_write" }
+       }
+     );
+ 
+     if (!existingEntry) {
+       throw new NotFoundException(`Article quotation entry with ID ${id} not found`);
+     }
+ 
+     // 2. Gestion de l'article
+     if (existingEntry.article) {
+       const newQuantity = updateDto.quantity ?? existingEntry.quantity;
+       const quantityDifference = newQuantity - existingEntry.quantity;
+       const newStock = existingEntry.article.quantityInStock - quantityDifference;
+ 
+       if (newStock < 0) {
+         throw new BadRequestException(
+           `Stock insuffisant. Disponible: ${existingEntry.article.quantityInStock}, Demandé: ${newQuantity}`
+         );
+       }
+ 
+       await transactionalEntityManager.update(
+         ArticleEntity,
+         existingEntry.article.id,
+         {
+           title: updateDto.article?.title ?? existingEntry.article.title,
+           description: updateDto.article?.description ?? existingEntry.article.description,
+           reference: updateDto.reference ?? existingEntry.article.reference,
+           unitPrice: updateDto.unit_price ?? existingEntry.article.unitPrice,
+           quantityInStock: newStock
+         }
+       );
+     }
+ 
+     // 3. Gestion des taxes - APPROCHE REVISITÉE
+     if (updateDto.taxes !== undefined) {
+       // D'abord charger les taxes existantes
+       const existingTaxes = await transactionalEntityManager.find(
+         ExpenseArticleInvoiceEntryTaxEntity,
+         { where: { expenseArticleInvoiceEntryId: id } }
+       );
+ 
+       // Supprimer les taxes qui ne sont plus dans la liste
+       const taxesToRemove = existingTaxes.filter(
+         tax => !updateDto.taxes?.includes(tax.taxId)
+       );
+       
+       if (taxesToRemove.length > 0) {
+         await transactionalEntityManager.remove(taxesToRemove);
+       }
+ 
+       // Ajouter les nouvelles taxes qui ne sont pas déjà présentes
+       const existingTaxIds = existingTaxes.map(tax => tax.taxId);
+       const taxesToAdd = (updateDto.taxes || [])
+         .filter(taxId => !existingTaxIds.includes(taxId))
+         .map(taxId => {
+           const newTax = new ExpenseArticleInvoiceEntryTaxEntity();
+           newTax.expenseArticleInvoiceEntryId = id;
+           newTax.taxId = taxId;
+           return newTax;
+         });
+ 
+       if (taxesToAdd.length > 0) {
+         await transactionalEntityManager.save(taxesToAdd);
+       }
+     }
+ 
+     // 4. Calcul des totaux
+     const taxes = updateDto.taxes !== undefined
+       ? await transactionalEntityManager.find(TaxEntity, {
+           where: { id: In(updateDto.taxes || []) }
+         })
+       : existingEntry.expenseArticleInvoiceEntryTaxes?.map(t => t.tax) || [];
+ 
+     const subTotal = this.calculationsService.calculateSubTotalForLineItem({
+       quantity: updateDto.quantity ?? existingEntry.quantity,
+       unit_price: updateDto.unit_price ?? existingEntry.unit_price,
+       discount: updateDto.discount ?? existingEntry.discount,
+       discount_type: updateDto.discount_type ?? existingEntry.discount_type,
+       taxes
+     });
+ 
+     const total = this.calculationsService.calculateTotalForLineItem({
+       quantity: updateDto.quantity ?? existingEntry.quantity,
+       unit_price: updateDto.unit_price ?? existingEntry.unit_price,
+       discount: updateDto.discount ?? existingEntry.discount,
+       discount_type: updateDto.discount_type ?? existingEntry.discount_type,
+       taxes
+     });
+ 
+     // 5. Mise à jour finale
+     const updatedEntry = await transactionalEntityManager.save(ExpenseArticleInvoiceEntryEntity, {
+       ...existingEntry,
+       ...updateDto,
+       subTotal,
+       total,
+       originalStock: existingEntry.article 
+         ? existingEntry.article.quantityInStock + (updateDto.quantity ?? existingEntry.quantity) 
+         : null
+     });
+ 
+     return updatedEntry;
+   });
+ }
+}
 
   async duplicate(
     id: number,
