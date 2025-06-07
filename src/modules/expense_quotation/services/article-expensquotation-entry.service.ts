@@ -15,6 +15,7 @@ import { ArticleExpensQuotationEntryTaxEntity } from '../repositories/entities/a
 import { TaxEntity } from 'src/modules/tax/repositories/entities/tax.entity';
 import { ArticleService } from 'src/modules/article/article/services/article.service';
 import { ArticleEntity } from 'src/modules/article/article/repositories/entities/article.entity';
+import { ArticleRepository } from 'src/modules/article/article/repositories/repository/article.repository';
 
 @Injectable()
 export class ArticleExpensQuotationEntryService {
@@ -24,7 +25,8 @@ export class ArticleExpensQuotationEntryService {
         private readonly articleService: ArticleService,
         private readonly taxService: TaxService,
         private readonly calculationsService: InvoicingCalculationsService,
-        private readonly entityManager:EntityManager
+        private readonly entityManager:EntityManager,
+        private readonly articleRepository:ArticleRepository
     ) {}
 
   async saveMany(
@@ -80,87 +82,64 @@ export class ArticleExpensQuotationEntryService {
         const articleTitle = createArticleExpensQuotationEntryDto.title || createArticleExpensQuotationEntryDto.article?.title;
         const articleDescription = createArticleExpensQuotationEntryDto.description || createArticleExpensQuotationEntryDto.article?.description;
 
-        // CAS 1: Article existant spécifié
-        if (createArticleExpensQuotationEntryDto.articleId) {
-            article = await this.articleService.findOneById(createArticleExpensQuotationEntryDto.articleId);
-            if (!article) {
-                throw new Error(`Article avec l'ID ${createArticleExpensQuotationEntryDto.articleId} non trouvé`);
-            }
+        // Vérifier d'abord si l'article existe par référence
+        article = await this.articleService.findOneByReference(
+            createArticleExpensQuotationEntryDto.reference
+        );
+
+        // Si c'est un nouvel article (pas de ID d'article fourni) et qu'un article avec cette référence existe déjà
+        if (!createArticleExpensQuotationEntryDto.article?.id && article) {
+            throw new Error(`Un article avec la référence ${createArticleExpensQuotationEntryDto.reference} existe déjà dans la base de données`);
+        }
+
+        // Si l'article existe déjà et qu'on l'a sélectionné (ID d'article fourni)
+        if (article && createArticleExpensQuotationEntryDto.article?.id) {
+            const requestedQuantity = createArticleExpensQuotationEntryDto.quantity || 0;
 
             // Vérification du stock
-            const requestedQuantity = createArticleExpensQuotationEntryDto.quantity || 0;
             if (article.quantityInStock < requestedQuantity) {
                 throw new Error(`Stock insuffisant pour ${article.reference}. Disponible: ${article.quantityInStock}, Demandé: ${requestedQuantity}`);
             }
 
             // Mise à jour du stock
-            article.quantityInStock -= requestedQuantity;
-            
-            // Mise à jour du prix si spécifié
-            if (createArticleExpensQuotationEntryDto.unit_price !== undefined) {
-                article.unitPrice = createArticleExpensQuotationEntryDto.unit_price;
+            await this.articleRepository.update(
+                article.id,
+                {
+                    quantityInStock: () => `quantityInStock - ${requestedQuantity}` as any,
+                    version: () => "version + 1" as any,
+                    ...(createArticleExpensQuotationEntryDto.unit_price !== undefined && {
+                        unitPrice: createArticleExpensQuotationEntryDto.unit_price
+                    })
+                }
+            );
+
+            // Recharger l'article
+            article = await this.articleService.findOneById(article.id);
+        } 
+        // Si l'article n'existe pas et qu'on veut en créer un nouveau
+        else if (!article) {
+            // CAS 2: Création d'un nouvel article
+            if (!articleTitle) {
+                throw new Error('Le titre de l\'article est obligatoire pour créer un nouvel article');
             }
 
-            await this.articleService.update(article.id, {
-                reference: article.reference,
-                quantityInStock: article.quantityInStock,
-                unitPrice: article.unitPrice
-            });
-        }
-        // CAS 2: Nouvel article à créer ou article existant par référence
-        else {
-            // D'abord vérifier si un article avec cette référence existe déjà
-            const existingArticle = await this.articleService.findOneByReference(
+            // Vérification supplémentaire au cas où findOneByReference aurait raté quelque chose
+            const existingWithSameRef = await this.articleService.findAllByReference(
                 createArticleExpensQuotationEntryDto.reference
             );
 
-            if (existingArticle) {
-                // Si l'article existe déjà, on l'utilise
-                article = existingArticle;
-
-                // Vérification du stock
-                const requestedQuantity = createArticleExpensQuotationEntryDto.quantity || 0;
-                if (article.quantityInStock < requestedQuantity) {
-                    throw new Error(`Stock insuffisant pour ${article.reference}. Disponible: ${article.quantityInStock}, Demandé: ${requestedQuantity}`);
-                }
-
-                // Mise à jour du stock
-                article.quantityInStock -= requestedQuantity;
-                
-                // Mise à jour du prix si spécifié
-                if (createArticleExpensQuotationEntryDto.unit_price !== undefined) {
-                    article.unitPrice = createArticleExpensQuotationEntryDto.unit_price;
-                }
-
-                await this.articleService.update(article.id, {
-                    reference: article.reference,
-                    quantityInStock: article.quantityInStock,
-                    unitPrice: article.unitPrice
-                });
-            } else {
-                // Avant de créer un nouvel article, vérifier si la référence existe déjà dans la base de données
-                const allArticlesWithSameRef = await this.articleService.findAllByReference(
-                    createArticleExpensQuotationEntryDto.reference
-                );
-
-                if (allArticlesWithSameRef && allArticlesWithSameRef.length > 0) {
-                    throw new Error(`Un article avec la référence ${createArticleExpensQuotationEntryDto.reference} existe déjà dans la base de données`);
-                }
-
-                // Création d'un nouvel article
-                if (!articleTitle) {
-                    throw new Error('Le titre de l\'article est obligatoire pour créer un nouvel article');
-                }
-
-                article = await this.articleService.save({
-                    title: articleTitle,
-                    description: articleDescription || '',
-                    reference: createArticleExpensQuotationEntryDto.reference,
-                    unitPrice: createArticleExpensQuotationEntryDto.unit_price || 0,
-                    quantityInStock: createArticleExpensQuotationEntryDto.quantity || 0,
-                    status: 'draft'
-                });
+            if (existingWithSameRef && existingWithSameRef.length > 0) {
+                throw new Error(`Un article avec la référence ${createArticleExpensQuotationEntryDto.reference} existe déjà dans la base de données`);
             }
+
+            article = await this.articleService.save({
+                title: articleTitle,
+                description: articleDescription || '',
+                reference: createArticleExpensQuotationEntryDto.reference,
+                unitPrice: createArticleExpensQuotationEntryDto.unit_price || 0,
+                quantityInStock: createArticleExpensQuotationEntryDto.quantity || 0,
+                status: 'draft'
+            });
         }
 
         // 5. Calcul des totaux

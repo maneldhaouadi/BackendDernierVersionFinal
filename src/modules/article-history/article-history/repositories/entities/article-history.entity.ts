@@ -12,11 +12,14 @@ export class ArticleHistoryEntity {
   @Column('json')
   changes: Record<string, { oldValue: any; newValue: any }>;
 
+  @Column('json') // Nouveau champ pour le snapshot complet
+  snapshot: Record<string, any>;
+
   @Column({ type: 'timestamp', default: () => 'CURRENT_TIMESTAMP' })
   date: Date;
   
   @Column({ default: false })
-  isActive: boolean; // Nouveau champ pour gérer l'activation
+  isActive: boolean;
   
   @ManyToOne(() => ArticleEntity, article => article.history, { 
     onDelete: 'CASCADE',

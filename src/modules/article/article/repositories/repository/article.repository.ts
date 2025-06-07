@@ -18,4 +18,6 @@ export class ArticleRepository extends DatabaseAbstractRepository<ArticleEntity>
   async find(options?: FindManyOptions<ArticleEntity>): Promise<ArticleEntity[]> {
     return this.articleRepository.find(options);
   }
+
+  
 }

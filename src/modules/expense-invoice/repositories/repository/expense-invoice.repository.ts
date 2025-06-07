@@ -15,4 +15,6 @@ export class ExpenseInvoiceRepository extends DatabaseAbstractRepository<Expense
   ) {
     super(invoiceRepository, txHost);
   }
+
+  
 }

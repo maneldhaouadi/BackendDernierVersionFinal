@@ -33,12 +33,16 @@ import { TemplateType } from "src/modules/template/enums/TemplateType";
 import ejs from "ejs";
 import { ExpenseArticleInvoiceEntryEntity } from "../repositories/entities/expense-article-invoice-entry.entity";
 import { ArticleEntity } from "src/modules/article/article/repositories/entities/article.entity";
+import { ExpenseUpdateInvoiceUploadDto } from "../dtos/expense-invoice-upload.update.dto";
+import { ExpenseInvoiceUploadEntity } from "../repositories/entities/expense-invoice-file.entity";
+import { ExpenseInvoiceUploadRepository } from "../repositories/repository/expense-invoice-upload.repository";
 
 @Injectable()
 export class ExpenseInvoiceService {
   constructor(
     //repositories
     private readonly invoiceRepository: ExpenseInvoiceRepository,
+    private readonly invoiceUploadRepository:ExpenseInvoiceUploadRepository,
     //entity services
     private readonly articleInvoiceEntryService: ExpenseArticleInvoiceEntryService,
     private readonly invoiceUploadService: ExpenseInvoiceUploadService,
@@ -271,7 +275,6 @@ private async generateSequentialNumber(): Promise<string> {
     const existingInvoice = await transactionalEntityManager.findOne(ExpenseInvoiceEntity, { 
       where: { id },
       relations: ['articleExpenseEntries', 'articleExpenseEntries.article'],
-      lock: { mode: "pessimistic_write" } // Verrou pour éviter les conflits
     });
 
     if (!existingInvoice) {
@@ -435,50 +438,30 @@ private async generateSequentialNumber(): Promise<string> {
   updateInvoiceDto: ExpenseUpdateInvoiceDto,
   existingUploads: ExpenseResponseInvoiceUploadDto[],
 ) {
-  const newUploads = [];
-  const keptUploads = [];
-  const eliminatedUploads = [];
-
-  if (!updateInvoiceDto.uploads) {
-    return { keptUploads, newUploads, eliminatedUploads };
+  // 1. Identifier les uploads à conserver et à supprimer
+  const keptUploadIds = (updateInvoiceDto.uploads || []).map(u => u.uploadId);
+  const uploadsToDelete = existingUploads.filter(u => !keptUploadIds.includes(u.uploadId));
+  
+  // 2. Supprimer seulement les uploads qui ne sont plus nécessaires
+  if (uploadsToDelete.length > 0) {
+    await this.invoiceUploadService.softDeleteMany(
+      uploadsToDelete.map(u => ({ id: u.id } as ExpenseInvoiceUploadEntity))
+    );
   }
 
-  try {
-    // 1. Gestion des suppressions en premier (opérations rapides)
-    for (const upload of existingUploads) {
-      const exists = updateInvoiceDto.uploads.some(u => u.uploadId === upload.uploadId);
-      if (!exists) {
-        console.log(`Suppression du fichier avec l'uploadId ${upload.uploadId}`);
-        const deletedUpload = await this.invoiceUploadService.softDelete(upload.id);
-        eliminatedUploads.push(deletedUpload);
-      } else {
-        keptUploads.push(upload);
-      }
-    }
-
-    // 2. Gestion des ajouts avec transactions séparées
-    const existingUploadIds = existingUploads.map(u => u.uploadId);
-    const uploadPromises = updateInvoiceDto.uploads
+  // 3. Ajouter uniquement les nouveaux uploads qui n'existent pas déjà
+  const existingUploadIds = existingUploads.map(u => u.uploadId);
+  const newUploads = await Promise.all(
+    (updateInvoiceDto.uploads || [])
       .filter(upload => !existingUploadIds.includes(upload.uploadId))
-      .map(async (upload) => {
-        console.log(`Tentative d'ajout d'un nouveau fichier avec l'uploadId ${upload.uploadId}`);
-        try {
-          const newUpload = await this.invoiceUploadService.save(id, upload.uploadId);
-          newUploads.push(newUpload);
-          return newUpload;
-        } catch (error) {
-          console.error(`Échec de l'ajout du fichier ${upload.uploadId}:`, error);
-          throw error;
-        }
-      });
+      .map(upload => this.invoiceUploadRepository.insertUnique(id, upload.uploadId))
+  );
 
-    await Promise.all(uploadPromises);
-  } catch (error) {
-    console.error('Erreur lors de la mise à jour des fichiers uploadés :', error);
-    throw new Error('Erreur lors de la mise à jour des fichiers uploadés');
-  }
-
-  return { keptUploads, newUploads, eliminatedUploads };
+  return {
+    keptUploads: existingUploads.filter(u => keptUploadIds.includes(u.uploadId)),
+    newUploads: newUploads.filter(Boolean),
+    eliminatedUploads: uploadsToDelete
+  };
 }
   
 

@@ -1,7 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { IQueryObject } from 'src/common/database/interfaces/database-query-options.interface';
 import { QueryBuilder } from 'src/common/database/utils/database-query-builder';
-import { FindManyOptions, FindOneOptions } from 'typeorm';
+import { EntityManager, FindManyOptions, FindOneOptions } from 'typeorm';
 import { PageDto } from 'src/common/database/dtos/database.page.dto';
 import { PageMetaDto } from 'src/common/database/dtos/database.page-meta.dto';
 import { StorageService } from 'src/common/storage/services/storage.service';
@@ -68,32 +68,60 @@ export class ExpenseInvoiceUploadService {
   }
 
   async save(
-    invoiceId: number,
-    uploadId: number,
-  ): Promise<ExpenseInvoiceUploadEntity> {
-    // Vérifier si le fichier est déjà associé à la facture
-    const existingUpload = await this.invoiceUploadRepository.findOne({
-      where: {
-        expenseInvoice: { id: invoiceId }, // Vérifier la relation avec la facture
-        uploadId,                          // Vérifier l'ID du fichier uploadé
-      },
-    });
-  
-    if (existingUpload) {
-      console.log('Le fichier est déjà associé à la facture:', existingUpload);
-      return existingUpload; // Retourner l'entrée existante
+  invoiceId: number,
+  uploadId: number,
+): Promise<ExpenseInvoiceUploadEntity> {
+  // Vérification plus robuste
+  const existingUpload = await this.invoiceUploadRepository.findOne({
+    where: {
+      expenseInvoiceId: invoiceId,
+      uploadId: uploadId,
+    },
+    withDeleted: true // Vérifie même les entrées supprimées logiquement
+  });
+
+  if (existingUpload) {
+    if (existingUpload.deletedAt) {
+      // Restaurer l'entrée si elle était supprimée logiquement
+      await this.invoiceUploadRepository.restore(existingUpload.id);
     }
-  
-    // Créer une nouvelle entrée
-    const newUpload = this.invoiceUploadRepository.create({
-      expenseInvoice: { id: invoiceId }, // Associer l'ID de la facture
-      uploadId,                          // Associer l'ID du fichier uploadé
-    });
-  
-    console.log('Ajout d\'un nouveau fichier avec l\'uploadId:', uploadId, 'et invoiceId:', invoiceId);
-    return this.invoiceUploadRepository.save(newUpload);
+    return existingUpload;
   }
+
+  // Création seulement si n'existe pas
+  const newUpload = this.invoiceUploadRepository.create({
+    expenseInvoiceId: invoiceId,
+    uploadId: uploadId,
+  });
+
+  return this.invoiceUploadRepository.save(newUpload);
+}
   
+  async saveWithTransaction(
+  invoiceId: number, 
+  uploadId: number, // Changé de string à number
+  transactionalEntityManager: EntityManager
+): Promise<ExpenseInvoiceUploadEntity> {
+  const newUpload = transactionalEntityManager.create(ExpenseInvoiceUploadEntity, {
+    expenseInvoice: { id: invoiceId }, // Référence à l'entité parente
+    upload: { id: uploadId },         // Référence à l'entité upload
+  });
+  return await transactionalEntityManager.save(newUpload);
+}
+  
+
+async existsByInvoiceAndUploadId(
+  invoiceId: number,
+  uploadId: number
+): Promise<boolean> {
+  const result = await this.invoiceUploadRepository.findOne({
+    where: {
+      expenseInvoiceId: invoiceId,
+      uploadId: uploadId
+    }
+  });
+  return !!result; // Retourne true si un résultat est trouvé
+}
 
   async duplicate(id: number, invoiceId: number): Promise<ExpenseInvoiceUploadEntity> {
     const originalInvoiceUpload = await this.findOneById(id);

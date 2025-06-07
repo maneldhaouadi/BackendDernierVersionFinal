@@ -17,6 +17,7 @@ import { UpdateArticleDto } from 'src/modules/article/article/dtos/article.updat
 import { ArticleEntity } from 'src/modules/article/article/repositories/entities/article.entity';
 import { ExpenseArticleInvoiceEntryTaxEntity } from '../repositories/entities/expense-article-invoice-entry-tax.entity';
 import { TaxEntity } from 'src/modules/tax/repositories/entities/tax.entity';
+import { ArticleRepository } from 'src/modules/article/article/repositories/repository/article.repository';
 
 @Injectable()
 export class ExpenseArticleInvoiceEntryService {
@@ -26,7 +27,8 @@ export class ExpenseArticleInvoiceEntryService {
     private readonly articleService: ArticleService,
     private readonly taxService: TaxService,
     private readonly calculationsService: InvoicingCalculationsService,
-     private readonly entityManager:EntityManager
+     private readonly entityManager:EntityManager,
+     private readonly articleRepository:ArticleRepository
     
   ) {}
 
@@ -78,81 +80,108 @@ export class ExpenseArticleInvoiceEntryService {
     return lineItems;
   }
 
-  async save(
+ async save(
     createArticleInvoiceEntryDto: ExpenseCreateArticleInvoiceEntryDto,
-  ): Promise<ExpenseArticleInvoiceEntryEntity> {
+): Promise<ExpenseArticleInvoiceEntryEntity> {
     // Récupérer les taxes
     const taxes = createArticleInvoiceEntryDto.taxes
-      ? await Promise.all(
-          createArticleInvoiceEntryDto.taxes.map(id => this.taxService.findOneById(id))
-        )
-      : [];
-  
+        ? await Promise.all(
+            createArticleInvoiceEntryDto.taxes.map(id => this.taxService.findOneById(id))
+          )
+        : [];
+
     // Trouver l'article par référence ou titre
     let article = createArticleInvoiceEntryDto.article.reference
-      ? await this.articleService.findOneByCondition({
-          filter: `reference||$eq||${createArticleInvoiceEntryDto.article.reference}`
-        })
-      : null;
-  
+        ? await this.articleService.findOneByCondition({
+            filter: `reference||$eq||${createArticleInvoiceEntryDto.article.reference}`
+          })
+        : null;
+
     if (!article && createArticleInvoiceEntryDto.article.title) {
-      article = await this.articleService.findOneByCondition({
-        filter: `title||$eq||${createArticleInvoiceEntryDto.article.title}`
-      });
+        article = await this.articleService.findOneByCondition({
+            filter: `title||$eq||${createArticleInvoiceEntryDto.article.title}`
+        });
     }
-  
+
     if (!article) {
-      // Créer un nouvel article sans historique
-      article = await this.articleService.save({
-        ...createArticleInvoiceEntryDto.article,
-        reference: createArticleInvoiceEntryDto.article.reference || 
-                  `REF-${Math.floor(100000000 + Math.random() * 900000000)}`,
-        quantityInStock: createArticleInvoiceEntryDto.quantity || 0,
-        unitPrice: createArticleInvoiceEntryDto.unit_price || 0
-      });
+        // Créer un nouvel article sans historique
+        article = await this.articleService.save({
+            ...createArticleInvoiceEntryDto.article,
+            reference: createArticleInvoiceEntryDto.article.reference || 
+                     `REF-${Math.floor(100000000 + Math.random() * 900000000)}`,
+            quantityInStock: createArticleInvoiceEntryDto.quantity || 0,
+            unitPrice: createArticleInvoiceEntryDto.unit_price || 0
+        });
     } else {
-      // Mettre à jour l'article existant sans historique
-      await this.articleService.update(article.id, {
-    reference: article.reference, // Include the existing reference
-    quantityInStock: article.quantityInStock,
-    unitPrice: article.unitPrice
-});
+    const quantityToDeduct = createArticleInvoiceEntryDto.quantity || 0;
+    
+    if (article.quantityInStock < quantityToDeduct) {
+        throw new BadRequestException(
+            `Stock insuffisant. Stock actuel: ${article.quantityInStock}, quantité demandée: ${quantityToDeduct}`
+        );
     }
-  
+
+    // Solution 1: Utilisation de update() avec syntaxe correcte pour MySQL
+    await this.articleRepository.update(
+        article.id,
+        {
+            quantityInStock: () => `quantityInStock - ${quantityToDeduct}`,
+            version: () => `version + 1`,
+            updatedAt: () => `CURRENT_TIMESTAMP`
+        }
+    );
+
+    // Solution alternative 2: Utilisation du QueryBuilder
+    /*
+    await this.articleRepository
+        .createQueryBuilder()
+        .update(ArticleEntity)
+        .set({
+            quantityInStock: () => `quantityInStock - ${quantityToDeduct}`,
+            version: () => `version + 1`,
+            updatedAt: () => `CURRENT_TIMESTAMP`
+        })
+        .where('id = :id', { id: article.id })
+        .execute();
+    */
+
+    // Recharger l'article pour avoir les données à jour
+    article = await this.articleService.findOneById(article.id);
+}
     // Créer l'entrée de facture
     const entry = await this.articleInvoiceEntryRepository.save({
-      ...createArticleInvoiceEntryDto,
-      reference: article.reference,
-      articleId: article.id,
-      article: article,
-      subTotal: this.calculationsService.calculateSubTotalForLineItem({
-        quantity: createArticleInvoiceEntryDto.quantity,
-        unit_price: createArticleInvoiceEntryDto.unit_price,
-        discount: createArticleInvoiceEntryDto.discount,
-        discount_type: createArticleInvoiceEntryDto.discount_type,
-        taxes: taxes
-      }),
-      total: this.calculationsService.calculateTotalForLineItem({
-        quantity: createArticleInvoiceEntryDto.quantity,
-        unit_price: createArticleInvoiceEntryDto.unit_price,
-        discount: createArticleInvoiceEntryDto.discount,
-        discount_type: createArticleInvoiceEntryDto.discount_type,
-        taxes: taxes
-      })
+        ...createArticleInvoiceEntryDto,
+        reference: article.reference,
+        articleId: article.id,
+        article: article,
+        subTotal: this.calculationsService.calculateSubTotalForLineItem({
+            quantity: createArticleInvoiceEntryDto.quantity,
+            unit_price: createArticleInvoiceEntryDto.unit_price,
+            discount: createArticleInvoiceEntryDto.discount,
+            discount_type: createArticleInvoiceEntryDto.discount_type,
+            taxes: taxes
+        }),
+        total: this.calculationsService.calculateTotalForLineItem({
+            quantity: createArticleInvoiceEntryDto.quantity,
+            unit_price: createArticleInvoiceEntryDto.unit_price,
+            discount: createArticleInvoiceEntryDto.discount,
+            discount_type: createArticleInvoiceEntryDto.discount_type,
+            taxes: taxes
+        })
     });
-  
+
     // Sauvegarder les taxes associées
     if (taxes.length > 0) {
-      await this.articleInvoiceEntryTaxService.saveMany(
-        taxes.map(tax => ({
-          taxId: tax.id,
-          articleInvoiceEntryId: entry.id
-        }))
-      );
+        await this.articleInvoiceEntryTaxService.saveMany(
+            taxes.map(tax => ({
+                taxId: tax.id,
+                articleInvoiceEntryId: entry.id
+            }))
+        );
     }
-  
+
     return entry;
-  }
+}
 
   async saveMany(
     createArticleInvoiceEntryDtos: ExpenseCreateArticleInvoiceEntryDto[],

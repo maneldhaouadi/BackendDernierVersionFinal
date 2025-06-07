@@ -23,6 +23,7 @@ import { ExpensePaymentModule } from '../expense-payment/expense-payment.module'
 import { ExpensePaymentInvoiceEntryService } from '../expense-payment/services/expense-payment-invoice-entry.service';
 import { TemplateModule } from '../template/template.module';
 import { ArticleModule } from '../article/article/article.module';
+import { ArticleRepositoryModule } from '../article/article/repositories/article.repository.module';
 
 @Module({
   controllers: [],
@@ -37,6 +38,8 @@ import { ArticleModule } from '../article/article/article.module';
   imports: [
     //repositories
     ExpenseInvoiceRepositoryModule,
+    ArticleRepositoryModule,
+    
     //entities
     ArticleModule,
     AppConfigModule,

@@ -20,6 +20,8 @@ import { ExpensQuotationController } from './controllers/expensquotation.control
 import { QuotationRepositoryModule } from './repositories/expensquotation.repository.module';
 import { TemplateModule } from '../template/template.module';
 import { ArticleModule } from '../article/article/article.module';
+import { ArticleService } from '../article/article/services/article.service';
+import { ArticleRepositoryModule } from '../article/article/repositories/article.repository.module';
 
 @Module({
   controllers: [ExpensQuotationController], // Ajout du contrôleur ici
@@ -34,6 +36,7 @@ import { ArticleModule } from '../article/article/article.module';
   imports: [
     //repositories
     QuotationRepositoryModule,
+    ArticleRepositoryModule,
     //entities
     ArticleModule,
     AppConfigModule,
@@ -49,7 +52,6 @@ import { ArticleModule } from '../article/article/article.module';
     CalculationsModule,
     StorageModule,
     TemplateModule,
-    ArticleModule
   ],
 })
 export class ExpenseQuotationModule {}

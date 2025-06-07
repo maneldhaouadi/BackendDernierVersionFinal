@@ -1,3 +1,4 @@
+
 import { Injectable, BadRequestException, NotFoundException, ConflictException, InternalServerErrorException, ForbiddenException } from '@nestjs/common';
 import { PageDto } from 'src/common/database/dtos/database.page.dto';
 import { PageMetaDto } from 'src/common/database/dtos/database.page-meta.dto';
@@ -111,10 +112,41 @@ async unarchiveArticle(id: number): Promise<ArticleEntity> {
     };
   }
 
-  async softDelete(id: number): Promise<ArticleEntity> {
+async delete(id: number): Promise<ArticleEntity> {
+    // 1. Vérifier que l'article existe
     const article = await this.findOneById(id);
+    
+    // 2. Vérifier les permissions de suppression
+    this.permissionService.validateAction(article.status, ArticleAction.DELETE);
+
+    // 3. Effectuer un soft delete
     await this.articleRepository.softDelete(id);
-    return article;
+
+    // 4. Mettre à jour le statut
+    article.status = 'deleted';
+    article.deletedAt = new Date();
+    
+    // 5. Enregistrer les modifications
+    const deletedArticle = await this.articleRepository.save(article);
+
+    // 6. Créer une entrée d'historique
+    await this.articleHistoryService.createHistoryEntry({
+      version: article.version + 1,
+      changes: {
+        status: {
+          oldValue: article.status,
+          newValue: 'deleted'
+        },
+        deletedAt: {
+          oldValue: null,
+          newValue: new Date()
+        }
+      },
+      articleId: id,
+      snapshot: article
+    });
+
+    return deletedArticle;
   }
 
   async getTopValuedArticles(): Promise<Array<{
@@ -155,49 +187,6 @@ async unarchiveArticle(id: number): Promise<ArticleEntity> {
     return result;
   }
 
-
-  async updateArticleStock(
-    id: number,
-    quantityChange: number
-  ): Promise<ArticleEntity> {
-    // 1. Trouver l'article existant
-    const article = await this.findOneById(id);
-    
-    // 2. Vérifier que la quantité ne deviendra pas négative
-    const newQuantity = article.quantityInStock + quantityChange;
-    if (newQuantity < 0) {
-      throw new BadRequestException(
-        `La quantité ne peut pas devenir négative. Stock actuel: ${article.quantityInStock}, changement demandé: ${quantityChange}`
-      );
-    }
-
-    // 3. Préparer les données de mise à jour
-    const updatePayload: Partial<ArticleEntity> = {
-      quantityInStock: newQuantity,
-      version: article.version + 1,
-      updatedAt: new Date()
-    };
-
-    // 4. Gérer l'historique des modifications
-    const changes = this.getChanges(article, updatePayload);
-    if (Object.keys(changes).length > 0) {
-      await this.articleHistoryService.createHistoryEntry({
-        version: updatePayload.version,
-        changes,
-        articleId: id
-      });
-    }
-
-    // 5. Appliquer la mise à jour
-    await this.articleRepository.update(id, updatePayload);
-    
-    // 6. Retourner l'article mis à jour
-    return this.articleRepository.findOne({ 
-      where: { id },
-      relations: ['history'] 
-    });
-  }
-  
   async updateStatus(id: number, newStatus: ArticleStatus): Promise<ArticleEntity> {
     const article = await this.findOneById(id);
     
@@ -346,7 +335,7 @@ async unarchiveArticle(id: number): Promise<ArticleEntity> {
 async findNonArchivedPaginated(): Promise<ResponseArticleDto[]> {
   const articles = await this.articleRepository.find({
     where: {
-      status: Not('archived')
+      status: Not(In(['archived', 'deleted'])) // Filtre les articles archivés ET supprimés
     },
     relations: ['history'] // Conservez les relations nécessaires
   });
@@ -501,43 +490,115 @@ async restoreArticle(id: number): Promise<ResponseArticleDto> {
     }
   }
   
-  async update(
+async update(id: number, updateArticleDto: UpdateArticleDto): Promise<ArticleEntity> {
+    // Validation des champs numériques
+    const numericFields = {
+        quantityInStock: updateArticleDto.quantityInStock,
+        unitPrice: updateArticleDto.unitPrice
+    };
+    
+    for (const [field, value] of Object.entries(numericFields)) {
+        if (value !== undefined && isNaN(Number(value))) {
+            throw new BadRequestException(`${field} must be a valid number`);
+        }
+    }
+
+    // Récupérer l'article actuel avant modification
+    const currentArticle = await this.findOneById(id);
+
+    // Conversion des types et préparation des données de mise à jour
+    // avec incrémentation automatique de la version
+    const updateData = {
+        ...updateArticleDto,
+        quantityInStock: updateArticleDto.quantityInStock !== undefined 
+            ? Number(updateArticleDto.quantityInStock) 
+            : undefined,
+        unitPrice: updateArticleDto.unitPrice !== undefined 
+            ? Number(updateArticleDto.unitPrice) 
+            : undefined,
+        version: currentArticle.version + 1 // Incrémentation automatique de la version
+    };
+
+    // Mettre à jour l'article
+    await this.articleRepository.update(id, updateData);
+    
+    // Récupérer l'article mis à jour
+    const updatedArticle = await this.articleRepository.findOne({ 
+        where: { id },
+        relations: ['history']
+    });
+
+    if (!updatedArticle) {
+        throw new NotFoundException(`Article avec ID ${id} non trouvé après mise à jour`);
+    }
+
+    // Créer un snapshot de l'article avant modification
+    const snapshot = {
+        title: currentArticle.title,
+        description: currentArticle.description,
+        reference: currentArticle.reference,
+        quantityInStock: currentArticle.quantityInStock,
+        unitPrice: currentArticle.unitPrice,
+        status: currentArticle.status,
+        version: currentArticle.version,
+        notes: currentArticle.notes,
+        createdAt: currentArticle.createdAt,
+        updatedAt: currentArticle.updatedAt
+    };
+
+    // Calculer les changements
+    const changes = this.getChanges(currentArticle, updatedArticle);
+
+    // Enregistrer dans l'historique seulement s'il y a des changements
+    if (Object.keys(changes).length > 0) {
+        await this.articleHistoryService.createHistoryEntry({
+            version: updatedArticle.version, // Utilise la nouvelle version incrémentée
+            changes,
+            articleId: id,
+            snapshot
+        });
+    }
+
+    return updatedArticle;
+}
+
+async updateArticleStock(
     id: number,
-    updateData: UpdateArticleDto
+    quantityChange: number
   ): Promise<ArticleEntity> {
     // 1. Trouver l'article existant
     const article = await this.findOneById(id);
     
-    // 2. Vérifier les permissions
-    this.permissionService.validateAction(article.status, ArticleAction.UPDATE);
-  
+    // 2. Vérifier que la quantité ne deviendra pas négative
+    const newQuantity = article.quantityInStock + quantityChange;
+    if (newQuantity < 0) {
+      throw new BadRequestException(
+        `La quantité ne peut pas devenir négative. Stock actuel: ${article.quantityInStock}, changement demandé: ${quantityChange}`
+      );
+    }
+
     // 3. Préparer les données de mise à jour
     const updatePayload: Partial<ArticleEntity> = {
-      ...updateData,
+      quantityInStock: newQuantity,
       version: article.version + 1,
       updatedAt: new Date()
     };
-  
-    // 4. Exclure le fichier justificatif de la mise à jour
-    delete updatePayload.justificatifFile;
-    delete updatePayload.justificatifFileName;
-    delete updatePayload.justificatifMimeType;
-    delete updatePayload.justificatifFileSize;
-  
-    // 5. Gérer l'historique des modifications
+
+    // 4. Gérer l'historique des modifications
     const changes = this.getChanges(article, updatePayload);
     if (Object.keys(changes).length > 0) {
       await this.articleHistoryService.createHistoryEntry({
         version: updatePayload.version,
         changes,
-        articleId: id
+        articleId: id,
+        snapshot: article // or create a proper snapshot object if needed
       });
     }
-  
-    // 6. Appliquer la mise à jour
+
+    // 5. Appliquer la mise à jour
     await this.articleRepository.update(id, updatePayload);
     
-    // 7. Retourner l'article mis à jour
+    // 6. Retourner l'article mis à jour
     return this.articleRepository.findOne({ 
       where: { id },
       relations: ['history'] 
@@ -560,21 +621,6 @@ async findOneByReference(reference: string): Promise<ArticleEntity | null> {
       return null;
     }
   }
-  async findAllByReference(reference: string): Promise<ArticleEntity[]> {
-  if (!reference) {
-    return [];
-  }
-  
-  try {
-    return await this.articleRepository.find({ 
-      where: { reference: ILike(`%${reference}%`) },
-      relations: ['history']
-    });
-  } catch (error) {
-    console.error('Error finding articles by reference:', error);
-    return [];
-  }
-}
    async checkArticleAvailability(articleId: number, requestedQuantity: number): Promise<{
     available: boolean;
     availableQuantity: number;
@@ -672,12 +718,7 @@ async findOneByReference(reference: string): Promise<ArticleEntity | null> {
     return article;
   }
   
-  async delete(id: number): Promise<ArticleEntity> {
-    const article = await this.findOneById(id);
-    this.permissionService.validateAction(article.status, ArticleAction.DELETE);
-    await this.articleRepository.softDelete(id);
-    return article;
-  }
+  
   
   async getArticleDetails(id: number): Promise<ArticleEntity> {
     return this.findOneById(id);
@@ -1234,4 +1275,20 @@ async findOneByReference(reference: string): Promise<ArticleEntity | null> {
   async getTotal(): Promise<number> {
     return this.articleRepository.getTotalCount();
   }
+
+  async findAllByReference(reference: string): Promise<ArticleEntity[]> {
+  if (!reference) {
+    return [];
+  }
+  
+  try {
+    return await this.articleRepository.find({ 
+      where: { reference: ILike(`%${reference}%`) },
+      relations: ['history']
+    });
+  } catch (error) {
+    console.error('Error finding articles by reference:', error);
+    return [];
+  }
+}
 }
