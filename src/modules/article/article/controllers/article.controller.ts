@@ -891,42 +891,18 @@ async getStockValueEvolution(
     };
   }
   */
-
-  @Post(':id/restore-archived')
-  @ApiOperation({ summary: 'Restore an archived article to active status' })
-  @ApiParam({ name: 'id', description: 'ID of the archived article to restore', type: Number })
-  @ApiResponse({ 
-    status: 200, 
-    description: 'Article successfully restored to active status',
-    type: ResponseArticleDto
-  })
-  @ApiResponse({ 
-    status: 404, 
-    description: 'Article not found'
-  })
-  @ApiResponse({ 
-    status: 400, 
-    description: 'Article is not archived or cannot be restored'
-  })
-  async restoreArchivedArticle(
-    @Param('id', ParseIntPipe) id: number
-  ): Promise<ResponseArticleDto> {
-    try {
-      return await this.articleService.restoreArticle(id);
-    } catch (error) {
-      if (error instanceof NotFoundException) {
-        throw new NotFoundException('article.not_found');
-      }
-      if (error instanceof BadRequestException) {
-        throw new BadRequestException({
-          message: 'article.restore_not_available',
-          statusCode: 400
-        });
-      }
-      throw new InternalServerErrorException({
-        message: 'article.restore_error',
-        statusCode: 500
-      });
-    }
-  }
+@Post(':id/restore-archived')
+@ApiOperation({ summary: 'Restore an archived article' })
+@ApiParam({ name: 'id', description: 'Article ID to restore' })
+@ApiResponse({ 
+  status: 200, 
+  description: 'Article successfully restored',
+  type: ResponseArticleDto
+})
+async restoreArchivedArticle(
+  @Param('id', ParseIntPipe) id: number
+): Promise<ResponseArticleDto> {
+  const article = await this.articleService.restoreArchivedArticle(id);
+  return this.mapToResponseDto(article);
+}
 }
