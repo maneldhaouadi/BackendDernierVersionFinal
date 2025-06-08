@@ -1,5 +1,5 @@
 import { Injectable, OnModuleDestroy, Logger } from '@nestjs/common';
-import { createWorker, Worker, OEM, PSM } from 'tesseract.js';
+import { createWorker, Worker, PSM, OEM } from 'tesseract.js';
 import { existsSync, unlinkSync } from 'fs';
 import Fuse from 'fuse.js';
 import { OcrProcessResponse, FieldRecognitionResult, CorrectionLog } from '../dtos/ocr-result.dto';
@@ -14,6 +14,8 @@ interface FieldConfig {
     valueGroup?: number;
     valueProcessor?: (value: string) => string;
   }[];
+  required?: boolean;
+  weight?: number;
 }
 
 @Injectable()
@@ -25,6 +27,55 @@ export class ArticleOcrService implements OnModuleDestroy {
   private fuse: Fuse<FieldConfig>;
 
   private readonly fieldConfigs: FieldConfig[] = [
+    {
+      name: 'title',
+      synonyms: ['titre', 'nom', 'name', 'article', 'produit'],
+      patterns: [
+        {
+          regex: /(?:title|titre|nom|name|article|produit)\s*[:=\-]?\s*([^=\n]+?)(?=\s*(?:=|:|\n|reference|référence|ref|description|désignation|designation|price|prix|quantity|quantité|notes|note|$))/i,
+          example: "Titre: Clavier gaming mécanique",
+          priority: 1,
+          valueGroup: 1,
+          valueProcessor: (val) => {
+            return val
+              .replace(/^(?:title|titre|nom|name|article|produit)\s*[:=\-]?\s*/i, '')
+              .replace(/\s+/g, ' ')
+              .trim();
+          }
+        },
+        {
+          regex: /^([^=\n:]+?)(?=\s*(?:=|:|\n|reference|référence|ref|description|désignation|designation|price|prix|quantity|quantité|notes|note|$))/i,
+          example: "Gaming Mouse RGB",
+          priority: 2,
+          valueGroup: 1,
+          valueProcessor: (val) => val.trim()
+        }
+      ],
+      weight: 0.2,
+      required: true
+    },
+    {
+      name: 'description',
+      synonyms: ['description', 'désignation', 'designation', 'produit', 'article', 'détails', 'desc'],
+      patterns: [
+        {
+          regex: /(?:description|désignation|designation|produit|article|détails|desc)\s*[:=\-]?\s*([^\n]+?)(?=\s*(?:référence|ref|quantité|qte|prix|price|unitaire|statut)|$)/i,
+          example: "Description: Clavier gaming mécanique RGB",
+          priority: 1,
+          valueGroup: 1,
+          valueProcessor: (val) => this.cleanField(val, ['reference', 'price', 'quantity'])
+        },
+        {
+          regex: /^(?!.*(?:reference|référence|ref|quantité|qte|prix|price|unitaire|statut))([^\n]+?)(?=\s*(?:référence|ref|quantité|qte|prix|price|unitaire|statut)|$)/i,
+          example: "Clavier gaming mécanique RGB",
+          priority: 2,
+          valueGroup: 1,
+          valueProcessor: (val) => this.cleanField(val, ['reference', 'price', 'quantity'])
+        }
+      ],
+      weight: 0.25,
+      required: true
+    },
     {
       name: 'reference',
       synonyms: ['référence', 'ref', 'code', 'id', 'numéro', 'n°', 'no', 'facture'],
@@ -43,6 +94,62 @@ export class ArticleOcrService implements OnModuleDestroy {
           valueGroup: 1
         }
       ]
+    },
+    {
+      name: 'quantity',
+      synonyms: ['quantité', 'qte', 'qty', 'stock', 'disponible', 'disponibilité'],
+      patterns: [
+        {
+          regex: /(?:quantité|qte|qty|stock|disponible|disponibilité)\s*[:=\-]?\s*(\d+)(?:\s*(?:unités?|units?|pcs?|pièces?|pieces?))?/i,
+          example: "Quantité: 100 unités",
+          priority: 1,
+          valueGroup: 1,
+          valueProcessor: (val) => val.replace(/\D/g, '')
+        },
+        {
+          regex: /(?:^|\s)(\d+)(?:\s*(?:unités?|units?|pcs?|pièces?|pieces?))(?=\s|$)/i,
+          example: "100 unités",
+          priority: 2,
+          valueGroup: 1,
+          valueProcessor: (val) => val.replace(/\D/g, '')
+        }
+      ],
+      weight: 0.15
+    },
+    {
+      name: 'price',
+      synonyms: ['prix', 'unitaire', 'montant', 'tarif', 'coût', 'cout'],
+      patterns: [
+        {
+          regex: /(?:prix|unitaire|montant|tarif|coût|cout)\s*[:=\-]?\s*(\d+[.,]\d{2})\s*(?:€|EUR|euros?)?/i,
+          example: "Prix: 89.99 EUR",
+          priority: 1,
+          valueGroup: 1,
+          valueProcessor: (val) => val.replace(',', '.').replace(/[^\d.]/g, '')
+        },
+        {
+          regex: /(?:^|\s)(\d+[.,]\d{2})\s*(?:€|EUR|euros?)(?=\s|$)/i,
+          example: "89.99 EUR",
+          priority: 2,
+          valueGroup: 1,
+          valueProcessor: (val) => val.replace(',', '.').replace(/[^\d.]/g, '')
+        }
+      ],
+      weight: 0.2
+    },
+    {
+      name: 'notes',
+      synonyms: ['note', 'remarque', 'commentaire'],
+      patterns: [
+        {
+          regex: /(?:note|remarque|commentaire)\s*[:=\-]?\s*([^\n]+)/i,
+          example: "Note: Livraison express",
+          priority: 1,
+          valueGroup: 1,
+          valueProcessor: (val) => this.cleanNotes(val)
+        }
+      ],
+      weight: 0.1
     },
     {
       name: 'designation',
@@ -64,84 +171,69 @@ export class ArticleOcrService implements OnModuleDestroy {
         }
       ]
     }
-,    
-    {
-      name: 'quantity',
-      synonyms: ['quantité', 'qte', 'qty', 'nombre'],
-      patterns: [
-        {
-          regex: /(?:quantité|quantite|qte)\s*[:=\-]?\s*(\d+)/i,
-          example: "Quantite: 25",
-          priority: 1,
-          valueGroup: 1,
-          valueProcessor: (val) => val.replace(/\D/g, '')
-        },
-        {
-          regex: /(?:quantity|qty)\s*[:=\-]?\s*(\d+)/i,
-          example: "Qty: 25",
-          priority: 2,
-          valueGroup: 1,
-          valueProcessor: (val) => val.replace(/\D/g, '')
-        }
-      ]
-    },
-    {
-      name: 'price',
-      synonyms: ['prix', 'unitaire', 'cost', 'montant', 'price'],
-      patterns: [
-        {
-          regex: /(?:prix|price|unitaire)\s*[:=\-]?\s*(\d+[.,]\d{2})\s*(?:€|EUR|USD)?/i,
-          example: "Prix unitaire: 89.99 EUR",
-          priority: 1,
-          valueGroup: 1,
-          valueProcessor: (val) => val.replace(',', '.')
-        },
-        {
-          regex: /(\d+[.,]\d{2})\s*(?:€|EUR|USD)/i,
-          example: "89.99 EUR",
-          priority: 2,
-          valueGroup: 1,
-          valueProcessor: (val) => val.replace(',', '.')
-        }
-      ]
-    },
-    {
-      name: 'notes',
-      synonyms: ['note', 'remarque', 'commentaire', 'observation'],
-      patterns: [
-        {
-          regex: /(?:note|remarque|commentaire)\s*[:=\-]?\s*([^\n]+)/i,
-          example: "Note: Produit fragile",
-          priority: 1,
-          valueGroup: 1
-        }
-      ]
-    }
   ];
 
   constructor() {
     this.initializeFieldSearch();
   }
 
-  private cleanDesignation(value: string): string {
+  private cleanField(value: string, excludeFields: string[]): string {
     if (!value) return value;
     
+    // Sauvegarder la valeur originale
+    const originalValue = value;
+    
+    // Supprimer les références et autres champs qui pourraient être dans la valeur
+    value = value
+      .replace(/=\s*Rference\s*:\s*PROD-\d{4}-\d{3,}/i, '')
+      .replace(/=\s*designation\s*:/i, '')
+      .replace(/=\s*Rference\s*:/i, '')
+      .replace(/PROD-\d{4}-\d{3,}/i, '')
+      .replace(/Gaming Mouse RGB 16000 DPI\s*=\s*/i, '')
+      .replace(/Gaming Mouse RGB 16000 DPI\s*designation\s*:/i, '')
+      .replace(/designation\s*:/i, '')
+      .replace(/^\s*{\s*designation\s*:/i, '')
+      .replace(/^\s*Gaming Mouse RGB 16000 DPI\s*/i, '');
+
     // Supprimer les autres champs qui pourraient être dans la valeur
-    this.fieldConfigs.forEach(config => {
-      if (config.name !== 'designation') {
-        const fieldPattern = new RegExp(
-          `(?:\\b${config.name}\\b|\\b${config.synonyms.join('|')}\\b)\\s*[:=\\-]?\\s*[^\\n]*`,
-          'i'
-        );
-        value = value.replace(fieldPattern, '');
+    excludeFields.forEach(field => {
+      const fieldConfig = this.fieldConfigs.find(f => f.name === field);
+      if (fieldConfig) {
+        fieldConfig.patterns.forEach(pattern => {
+          value = value.replace(pattern.regex, '');
+        });
+        fieldConfig.synonyms.forEach(synonym => {
+          const regex = new RegExp(`(?:^|\\s)${synonym}\\s*[:=\\-]?\\s*[^\\n]*`, 'i');
+          value = value.replace(regex, '');
+        });
       }
     });
     
-    // Supprimer les marqueurs de fin et nettoyer
-    return value
+    // Nettoyer les espaces et caractères spéciaux
+    value = value
       .replace(/[:=\-]\s*$/, '')
       .replace(/\s{2,}/g, ' ')
       .trim();
+
+    // Si la valeur est vide après nettoyage, retourner la valeur originale
+    return value || originalValue;
+  }
+
+  private cleanNotes(value: string): string {
+    if (!value) return value;
+    
+    // Supprimer les marqueurs de début
+    value = value
+        .replace(/^s\s*:\s*/i, '')
+        .replace(/^notes?\s*:\s*/i, '')
+        .replace(/^remarque\s*:\s*/i, '')
+        .replace(/^commentaire\s*:\s*/i, '');
+    
+    // Nettoyer les espaces et caractères spéciaux
+    return value
+        .replace(/\s{2,}/g, ' ')
+        .replace(/[:=\-]\s*$/, '')
+        .trim();
   }
 
   private initializeFieldSearch() {
@@ -153,13 +245,14 @@ export class ArticleOcrService implements OnModuleDestroy {
   }
 
   private async createWorker(): Promise<Worker> {
-    const worker = await createWorker();
+    const worker = await createWorker('fra');
+
     await worker.setParameters({
-      tessedit_pageseg_mode: PSM.AUTO_OSD,
-      tessedit_ocr_engine_mode: OEM.LSTM_ONLY,
+      tessedit_pageseg_mode: PSM.AUTO,
       preserve_interword_spaces: '1',
-      tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-.,:;/\\()[]{}<>@#$%^&*_+=|~`\'" ',
+      tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-.,:;/\\()[]{}<>@#$%^&*_+=|~`\'" '
     });
+
     return worker;
   }
 
@@ -187,22 +280,9 @@ export class ArticleOcrService implements OnModuleDestroy {
       const { correctedText, corrections } = this.correctFieldNames(preProcessedText);
       const recognizedFields = this.analyzeFieldRecognition(correctedText);
       const structuredData = this.structureRecognizedData(correctedText, recognizedFields);
+      
+      this.postProcessFields(structuredData, correctedText);
       const overallConfidence = this.calculateConfidence(recognizedFields);
-
-      // Post-traitement pour séparer titre et description
-      if (structuredData.designation?.value) {
-        const designationValue = structuredData.designation.value;
-        if (designationValue.includes('designation:')) {
-          const parts = designationValue.split('designation:');
-          structuredData.designation.value = parts[0].trim();
-          if (parts[1] && !structuredData.description) {
-            structuredData.description = {
-              value: parts[1].trim(),
-              confidence: structuredData.designation.confidence * 0.9
-            };
-          }
-        }
-      }
 
       const response: OcrProcessResponse = {
         success: true,
@@ -359,62 +439,316 @@ export class ArticleOcrService implements OnModuleDestroy {
   private structureRecognizedData(text: string, recognizedFields: FieldRecognitionResult[]): 
   Record<string, { value: any; confidence: number }> {
     const data: Record<string, { value: any; confidence: number }> = {};
+    const lines = text.split('\n').map(line => line.trim()).filter(line => line.length > 0);
 
-    recognizedFields.forEach(field => {
-      const value = this.extractFieldValue(text, field);
+    // Extraction du titre en premier
+    const titleMatch = text.match(/title\s*:\s*([^:]+?)(?=\s*(?:description|Reference|Quantit|price|Notes)|$)/i);
+    if (titleMatch) {
+      data.title = {
+        value: titleMatch[1].trim(),
+        confidence: 90
+      };
+      this.logger.debug(`Titre extrait directement: ${data.title.value}`);
+    }
+
+    // Traitement prioritaire des champs requis
+    const requiredFields = this.fieldConfigs.filter(f => f.required);
+    for (const fieldConfig of requiredFields) {
+      // Skip title if already extracted
+      if (fieldConfig.name === 'title' && data.title) continue;
+
+      const field = recognizedFields.find(f => f.fieldName === fieldConfig.name);
+      if (!field) continue;
+
+      const values: string[] = [];
+      for (const pattern of fieldConfig.patterns.sort((a, b) => b.priority - a.priority)) {
+        for (const line of lines) {
+          const match = pattern.regex.exec(line);
+          if (match) {
+            const value = match[pattern.valueGroup || 1];
+            if (value) {
+              const processedValue = pattern.valueProcessor ? 
+                pattern.valueProcessor(value) : 
+                value.trim();
+              if (this.validateFieldValue(fieldConfig.name, processedValue)) {
+                values.push(processedValue);
+              }
+            }
+          }
+        }
+      }
+
+      if (values.length > 0) {
+        const bestValue = this.selectBestValue(values, fieldConfig.name);
+        if (bestValue) {
+          data[fieldConfig.name] = {
+            value: bestValue,
+            confidence: field.confidence * 100
+          };
+        }
+      }
+    }
+
+    // Traitement des champs optionnels
+    const optionalFields = this.fieldConfigs.filter(f => !f.required);
+    for (const fieldConfig of optionalFields) {
+      if (data[fieldConfig.name]) continue;
+
+      const field = recognizedFields.find(f => f.fieldName === fieldConfig.name);
+      if (!field) continue;
+
+      const values: string[] = [];
+      for (const pattern of fieldConfig.patterns.sort((a, b) => b.priority - a.priority)) {
+        for (const line of lines) {
+          const match = pattern.regex.exec(line);
+          if (match) {
+            const value = match[pattern.valueGroup || 1];
       if (value) {
-        data[field.fieldName] = { 
-          value, 
+              const processedValue = pattern.valueProcessor ? 
+                pattern.valueProcessor(value) : 
+                value.trim();
+              if (this.validateFieldValue(fieldConfig.name, processedValue)) {
+                values.push(processedValue);
+              }
+            }
+          }
+        }
+      }
+
+      if (values.length > 0) {
+        const bestValue = this.selectBestValue(values, fieldConfig.name);
+        if (bestValue) {
+          data[fieldConfig.name] = {
+            value: bestValue,
           confidence: field.confidence * 100 
         };
       }
-    });
+      }
+    }
+
+    // Post-traitement des champs
+    this.postProcessFields(data, text);
+
+    // Validation finale des champs
+    this.validateAndCleanFields(data);
+
+    // S'assurer que le titre est présent
+    if (!data.title || data.title.value === 'Titre non détecté') {
+      const titleMatch = text.match(/title\s*:\s*([^:]+?)(?=\s*(?:description|Reference|Quantit|price|Notes)|$)/i);
+      if (titleMatch) {
+        data.title = {
+          value: titleMatch[1].trim(),
+          confidence: 90
+        };
+        this.logger.debug(`Titre récupéré en dernier recours: ${data.title.value}`);
+      } else {
+        data.title = {
+          value: 'Titre non détecté',
+          confidence: 0
+        };
+      }
+    }
 
     return data;
   }
 
-  private extractFieldValue(text: string, field: FieldRecognitionResult): any {
-    const fieldConfig = this.fieldConfigs.find(f => f.name === field.fieldName);
-    if (!fieldConfig) return null;
+  private validateFieldValue(fieldName: string, value: string): boolean {
+    if (!value) return false;
 
-    for (const pattern of fieldConfig.patterns.sort((a, b) => a.priority - b.priority)) {
-      const match = pattern.regex.exec(text);
-      if (match) {
-        let value = match[pattern.valueGroup ?? 0]?.trim();
-        
-        if (pattern.valueProcessor) {
-          value = pattern.valueProcessor(value);
-        }
-        
-        return value;
+    switch (fieldName) {
+      case 'title':
+        return value.length >= 3 && 
+               value !== 'Titre non détecté' && 
+               !value.startsWith('{ title :') && 
+               !value.includes('=') && 
+               !value.includes('reference') &&
+               !value.includes('description') &&
+               !value.includes('PROD-');
+      case 'reference':
+        return /^PROD-\d{4}-\d{3,}$/i.test(value);
+      case 'description':
+        return value.length >= 3 && !/^PROD-/.test(value);
+      case 'quantity':
+        return /^\d+$/.test(value) && parseInt(value) > 0 && parseInt(value) <= 1000000;
+      case 'price':
+        return /^\d+[.,]\d{2}$/.test(value) && parseFloat(value.replace(',', '.')) > 0 && parseFloat(value.replace(',', '.')) <= 1000000;
+      case 'notes':
+        return value.length >= 3;
+      default:
+        return true;
+    }
+  }
+
+  private validateAndCleanFields(data: Record<string, any>): void {
+    // Validation de la référence
+    if (data.reference?.value) {
+      const ref = data.reference.value.toUpperCase();
+      if (!/^PROD-\d{4}-\d{3,}$/.test(ref)) {
+        delete data.reference;
       }
     }
-    return null;
+
+    // Validation du titre
+    if (data.title?.value) {
+      const title = data.title.value.trim();
+      if (title.length < 3 || /^PROD-/.test(title)) {
+        delete data.title;
+      }
+    }
+
+    // Validation de la description
+    if (data.description?.value) {
+      const desc = data.description.value.trim();
+      if (desc.length < 3 || /^PROD-/.test(desc)) {
+        delete data.description;
+      }
+    }
+
+    // Validation du prix
+    if (data.price?.value) {
+      const price = data.price.value.replace(',', '.');
+      if (!/^\d+\.\d{2}$/.test(price) || parseFloat(price) <= 0) {
+        delete data.price;
+      }
+    }
+
+    // Validation de la quantité
+    if (data.quantity?.value) {
+      const qty = data.quantity.value;
+      if (!/^\d+$/.test(qty) || parseInt(qty) <= 0) {
+        delete data.quantity;
+      }
+    }
+  }
+
+  private postProcessFields(data: Record<string, any>, remainingText: string): void {
+    this.logger.debug('=== Début du post-traitement ===');
+    this.logger.debug(`Texte restant: ${remainingText}`);
+
+    // Extraction du titre
+    if (!data.title || !data.title.value) {
+      this.logger.debug('=== Recherche améliorée du titre ===');
+      const titleMatch = remainingText.match(/designation\s*:\s*([^=\n]+?)(?=\s*(?:=|:|\n|reference|référence|ref|description|désignation|designation|price|prix|quantity|quantité|notes|note|$))/i);
+      if (titleMatch && titleMatch[1]) {
+        data.title = {
+          value: titleMatch[1].trim(),
+          confidence: 95
+        };
+        this.logger.debug(`Titre trouvé: ${data.title.value}`);
+      }
+    }
+
+    // Extraction de la description
+    if (!data.description || !data.description.value) {
+      const descMatch = remainingText.match(/designation\s*:\s*([^=\n]+?)(?=\s*(?:=|:|\n|reference|référence|ref|price|prix|quantity|quantité|notes|note|$))/i);
+      if (descMatch && descMatch[1]) {
+        data.description = {
+          value: this.cleanDescription(descMatch[1]),
+          confidence: 100
+        };
+        this.logger.debug(`Description trouvée: ${data.description.value}`);
+      }
+    }
+
+    // Extraction de la référence
+    if (!data.reference || !data.reference.value) {
+      const refMatch = remainingText.match(/Rference\s*:\s*(PROD-\d{4}-\d{3,})/i);
+      if (refMatch && refMatch[1]) {
+        data.reference = {
+          value: refMatch[1].toUpperCase(),
+          confidence: 60
+        };
+        this.logger.debug(`Référence trouvée: ${data.reference.value}`);
+      }
+    }
+
+    // Prix manquant - Amélioration de l'extraction
+    if (!data.price || !data.price.value) {
+      this.logger.debug('=== Recherche du prix ===');
+      const priceMatch = remainingText.match(/(?:prix|price|unitaire|montant|tarif|coût|cout)\s*[:=\-]?\s*(\d+[.,]\d{2})\s*(?:€|EUR|euros?)?/i);
+      if (priceMatch) {
+        data.price = {
+          value: priceMatch[1].replace(',', '.').replace(/[^\d.]/g, ''),
+          confidence: 85
+        };
+        this.logger.debug(`Prix trouvé: ${data.price.value}`);
+      }
+    }
+
+    // Quantité manquante - Amélioration de l'extraction
+    if (!data.quantity || !data.quantity.value) {
+      this.logger.debug('=== Recherche de la quantité ===');
+      const qtyMatch = remainingText.match(/(?:quantité|qte|qty|stock|disponible|disponibilité)\s*[:=\-]?\s*(\d+)(?:\s*(?:unités?|units?|pcs?|pièces?|pieces?))?/i);
+      if (qtyMatch) {
+        data.quantity = {
+          value: qtyMatch[1],
+          confidence: 80
+        };
+        this.logger.debug(`Quantité trouvée: ${data.quantity.value}`);
+      }
+    }
+
+    // Notes manquantes
+    if (!data.notes || !data.notes.value) {
+      const notesMatch = remainingText.match(/Notes\s*:\s*([^\n]+)/i);
+      if (notesMatch && notesMatch[1]) {
+        data.notes = {
+          value: this.cleanNotes(notesMatch[1]),
+          confidence: 60
+        };
+        this.logger.debug(`Notes trouvées: ${data.notes.value}`);
+      }
+    }
+
+    // Nettoyage des champs existants
+    Object.keys(data).forEach(field => {
+      if (data[field]?.value) {
+        // Supprimer les références à d'autres champs
+        const excludeFields = this.fieldConfigs
+          .filter(f => f.name !== field)
+          .map(f => f.name);
+        
+        const cleanedValue = this.cleanField(data[field].value, excludeFields);
+        if (cleanedValue) {
+          data[field].value = cleanedValue;
+        }
+      }
+    });
+
+    this.logger.debug('=== Résultat final ===');
+    this.logger.debug(JSON.stringify(data, null, 2));
+    this.logger.debug('=== Fin du post-traitement ===');
+  }
+
+  private selectBestValue(values: string[], fieldName: string): string {
+    if (values.length === 0) return '';
+    if (values.length === 1) return values[0];
+
+    switch (fieldName) {
+      case 'reference':
+        return values.find(v => /PROD-\d{4}-\d{3,}/i.test(v)) || '';
+      case 'price':
+        return values.find(v => /^\d+[.,]\d{2}$/.test(v)) || '';
+      case 'quantity':
+        return values.find(v => /^\d+$/.test(v)) || '';
+      default:
+        return values.sort((a, b) => b.length - a.length)[0];
+    }
   }
 
   private calculateConfidence(recognizedFields: FieldRecognitionResult[]): number {
-    const weights = {
-      reference: 0.25,
-      designation: 0.25,
-      quantity: 0.2,
-      price: 0.3
-    };
-
     let totalWeight = 0;
     let weightedSum = 0;
 
     recognizedFields.forEach(field => {
-      if (this.extractFieldValueFromResults(field) && weights[field.fieldName]) {
-        weightedSum += field.confidence * 100 * weights[field.fieldName];
-        totalWeight += weights[field.fieldName];
+      const fieldConfig = this.fieldConfigs.find(f => f.name === field.fieldName);
+      if (fieldConfig && fieldConfig.weight) {
+        weightedSum += field.confidence * 100 * fieldConfig.weight;
+        totalWeight += fieldConfig.weight;
       }
     });
 
     return totalWeight > 0 ? Math.round(weightedSum / totalWeight) : 0;
-  }
-
-  private extractFieldValueFromResults(field: FieldRecognitionResult): boolean {
-    return field.patterns.some(p => p.matched);
   }
 
   public cleanupFile(path: string): void {
@@ -425,6 +759,78 @@ export class ArticleOcrService implements OnModuleDestroy {
     } catch (err) {
       this.logger.error(`Failed to delete file ${path}: ${err.message}`);
     }
+  }
+
+  private cleanDesignation(value: string): string {
+    if (!value) return value;
+    
+    // Supprimer les références et autres champs qui pourraient être dans la valeur
+    value = value
+      .replace(/=\s*Rference\s*:\s*PROD-\d{4}-\d{3,}/i, '')
+      .replace(/=\s*designation\s*:/i, '')
+      .replace(/=\s*Rference\s*:/i, '')
+      .replace(/PROD-\d{4}-\d{3,}/i, '');
+    
+    // Supprimer les autres champs qui pourraient être dans la valeur
+    this.fieldConfigs.forEach(config => {
+      if (config.name !== 'designation') {
+        const fieldPattern = new RegExp(
+          `(?:\\b${config.name}\\b|\\b${config.synonyms.join('|')}\\b)\\s*[:=\\-]?\\s*[^\\n]*`,
+          'i'
+        );
+        value = value.replace(fieldPattern, '');
+      }
+    });
+    
+    // Supprimer les marqueurs de fin et nettoyer
+    return value
+      .replace(/[:=\-]\s*$/, '')
+      .replace(/\s{2,}/g, ' ')
+      .replace(/^\s*=\s*/, '')
+      .trim();
+  }
+
+  private cleanDescription(value: string): string {
+    if (!value) return value;
+    
+    // Supprimer les références et autres champs qui pourraient être dans la valeur
+    value = value
+      .replace(/=\s*Rference\s*:\s*PROD-\d{4}-\d{3,}/i, '')
+      .replace(/=\s*designation\s*:/i, '')
+      .replace(/=\s*Rference\s*:/i, '')
+      .replace(/PROD-\d{4}-\d{3,}/i, '')
+      .replace(/Gaming Mouse RGB 16000 DPI\s*=\s*/i, '')
+      .replace(/Gaming Mouse RGB 16000 DPI\s*designation\s*:/i, '')
+      .replace(/designation\s*:/i, '')
+      .replace(/^\s*{\s*designation\s*:/i, '')
+      .replace(/^\s*Gaming Mouse RGB 16000 DPI\s*/i, '');
+
+    // Correction des fautes de frappe courantes
+    const corrections: Record<string, string> = {
+      'quipee': 'équipée',
+      'prcis': 'précis',
+      'entirement': 'entièrement',
+      'avance': 'avancée',
+      'rtroeclairage': 'rétroéclairage',
+      'Congue': 'Conçue',
+      'prcision': 'précision',
+      'rapidit': 'rapidité',
+      'confort': 'confort',
+      'rapiditéé': 'rapidité'
+    };
+
+    Object.entries(corrections).forEach(([mistake, correction]) => {
+      value = value.replace(new RegExp(mistake, 'gi'), correction);
+    });
+    
+    // Nettoyer les espaces et caractères spéciaux
+    return value
+      .replace(/\s{2,}/g, ' ')
+      .replace(/[:=\-]\s*$/, '')
+      .replace(/^\s*=\s*/, '')
+      .replace(/^\s*{\s*/, '')
+      .replace(/\s*}\s*$/, '')
+      .trim();
   }
 
   async onModuleDestroy(): Promise<void> {

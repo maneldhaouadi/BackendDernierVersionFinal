@@ -1,4 +1,3 @@
-
 import { Injectable, BadRequestException, NotFoundException, ConflictException, InternalServerErrorException, ForbiddenException } from '@nestjs/common';
 import { PageDto } from 'src/common/database/dtos/database.page.dto';
 import { PageMetaDto } from 'src/common/database/dtos/database.page-meta.dto';
@@ -40,6 +39,7 @@ export class ArticleService {
 
 
 //////
+/*
 async getActiveArticles(page: number = 1, limit: number = 10): Promise<ArticleEntity[]> {
   return this.articleRepository.find({
     where: { 
@@ -52,13 +52,103 @@ async getActiveArticles(page: number = 1, limit: number = 10): Promise<ArticleEn
     relations: ['history']
   });
 }
-
+*/
 async getArchivedArticles(page: number = 1, limit: number = 10): Promise<ArticleEntity[]> {
   return this.articleRepository.find({
     where: { 
       status: 'archived',
       deletedAt: null 
     },
+    order: { updatedAt: 'DESC' },
+    skip: (page - 1) * limit,
+    take: limit,
+    relations: ['history']
+  });
+}async delete(id: number): Promise<ArticleEntity> {
+    // 1. Trouver l'article existant
+    const article = await this.findOneById(id);
+    
+    // 2. Vérifier que l'article n'est pas déjà supprimé
+    if (article.status === 'deleted') {
+        throw new BadRequestException('Cet article est déjà marqué comme supprimé');
+    }
+
+    // 3. Vérifier les permissions de suppression
+    this.permissionService.validateAction(article.status, ArticleAction.DELETE);
+
+    // 4. Sauvegarder l'ancien statut pour l'historique
+    const previousStatus = article.status;
+
+    // 5. Mettre à jour le statut et la date de suppression
+    article.status = 'deleted';
+    article.deletedAt = new Date();
+    article.version += 1;
+    
+    // 6. Enregistrer les modifications (cela fera aussi le soft delete)
+    const deletedArticle = await this.articleRepository.save(article);
+
+    // 7. Créer une entrée d'historique
+    await this.articleHistoryService.createHistoryEntry({
+        version: deletedArticle.version,
+        changes: {
+            status: {
+                oldValue: previousStatus,
+                newValue: 'deleted'
+            },
+            deletedAt: {
+                oldValue: null,
+                newValue: deletedArticle.deletedAt
+            }
+        },
+        articleId: id,
+        snapshot: article
+    });
+
+    return deletedArticle;
+}
+
+async markAsDeleted(id: number): Promise<ArticleEntity> {
+  const article = await this.findOneById(id);
+  
+  if (article.status === 'deleted') {
+    throw new BadRequestException('Cet article est déjà marqué comme supprimé');
+  }
+
+  const previousStatus = article.status;
+  article.status = 'deleted';
+  article.deletedAt = new Date();
+  article.version += 1;
+
+  const updatedArticle = await this.articleRepository.save(article);
+
+  await this.articleHistoryService.createHistoryEntry({
+    version: updatedArticle.version,
+    changes: {
+      status: {
+        oldValue: previousStatus,
+        newValue: 'deleted'
+      },
+      deletedAt: {
+        oldValue: null,
+        newValue: updatedArticle.deletedAt
+      }
+    },
+    articleId: id,
+    snapshot: article
+  });
+
+  return updatedArticle;
+}
+
+
+async getActiveArticles(page: number = 1, limit: number = 10): Promise<ArticleEntity[]> {
+  return this.articleRepository.find({
+    where: [
+      { 
+        status: Not(In(['archived', 'deleted'])),
+        deletedAt: null
+      }
+    ],
     order: { updatedAt: 'DESC' },
     skip: (page - 1) * limit,
     take: limit,
@@ -112,42 +202,6 @@ async unarchiveArticle(id: number): Promise<ArticleEntity> {
     };
   }
 
-async delete(id: number): Promise<ArticleEntity> {
-    // 1. Vérifier que l'article existe
-    const article = await this.findOneById(id);
-    
-    // 2. Vérifier les permissions de suppression
-    this.permissionService.validateAction(article.status, ArticleAction.DELETE);
-
-    // 3. Effectuer un soft delete
-    await this.articleRepository.softDelete(id);
-
-    // 4. Mettre à jour le statut
-    article.status = 'deleted';
-    article.deletedAt = new Date();
-    
-    // 5. Enregistrer les modifications
-    const deletedArticle = await this.articleRepository.save(article);
-
-    // 6. Créer une entrée d'historique
-    await this.articleHistoryService.createHistoryEntry({
-      version: article.version + 1,
-      changes: {
-        status: {
-          oldValue: article.status,
-          newValue: 'deleted'
-        },
-        deletedAt: {
-          oldValue: null,
-          newValue: new Date()
-        }
-      },
-      articleId: id,
-      snapshot: article
-    });
-
-    return deletedArticle;
-  }
 
   async getTopValuedArticles(): Promise<Array<{
     reference: string;
@@ -188,28 +242,66 @@ async delete(id: number): Promise<ArticleEntity> {
   }
 
   async updateStatus(id: number, newStatus: ArticleStatus): Promise<ArticleEntity> {
+    // 1. Trouver l'article existant
     const article = await this.findOneById(id);
     
-    // Vérification des permissions
+    // 2. Vérifier que l'article n'est pas déjà supprimé
+    if (article.status === 'deleted') {
+        throw new BadRequestException('Impossible de modifier le statut d\'un article supprimé');
+    }
+
+    // 3. Vérifier les permissions
     this.permissionService.validateAction(article.status, ArticleAction.CHANGE_STATUS);
 
-    // Mise à jour simple
-    const updatePayload = {
-      status: newStatus,
-      version: article.version + 1,
-      updatedAt: new Date()
+    // 4. Sauvegarder l'ancien statut pour l'historique
+    const previousStatus = article.status;
+
+    // 5. Préparer les données de mise à jour
+    const updatePayload: Partial<ArticleEntity> = {
+        status: newStatus,
+        version: article.version + 1,
+        updatedAt: new Date()
     };
 
-    try {
-      return await this.articleRepository.save({
-        ...article,
-        ...updatePayload
-      });
-    } catch (error) {
-      this.handleSaveError(error, article.reference);
+    // 6. Si le nouveau statut est 'deleted', ajouter la date de suppression
+    if (newStatus === 'deleted') {
+        updatePayload.deletedAt = new Date();
     }
+
+    // 7. Appliquer les modifications
+    await this.articleRepository.update(id, updatePayload);
+
+    // 8. Récupérer l'article mis à jour
+    const updatedArticle = await this.articleRepository.findOne({ 
+        where: { id },
+        relations: ['history']
+    });
+
+    if (!updatedArticle) {
+        throw new NotFoundException('Article non trouvé après mise à jour du statut');
+    }
+
+    // 9. Enregistrer dans l'historique
+    await this.articleHistoryService.createHistoryEntry({
+        version: updatedArticle.version,
+        changes: {
+            status: {
+                oldValue: previousStatus,
+                newValue: newStatus
+            },
+            ...(newStatus === 'deleted' ? {
+                deletedAt: {
+                    oldValue: null,
+                    newValue: updatedArticle.deletedAt
+                }
+            } : {})
+        },
+        articleId: id,
+        snapshot: article
+    });
+
+    return updatedArticle;
 }
-  
   async suggestArchiving(): Promise<ArticleEntity[]> {
     const sixMonthsAgo = new Date();
     sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
@@ -353,26 +445,42 @@ async findAllArchived(): Promise<ResponseArticleDto[]> {
 }
 
 async restoreArticle(id: number): Promise<ResponseArticleDto> {
-  // 1. Restaurer le soft delete
-  await this.articleRepository.update(id, { deletedAt: null });
+  try {
+    // 1. Vérifier si l'article existe
+    const article = await this.articleRepository.findOne({
+      where: { id }
+    });
 
-  // 2. Mettre à jour le statut
-  await this.articleRepository.update(id, { 
-    status: 'active',
-    version: () => "version + 1"
-  });
+    if (!article) {
+      throw new NotFoundException('article.not_found');
+    }
 
-  // 3. Récupérer l'article mis à jour
-  const updatedArticle = await this.articleRepository.findOne({
-    where: { id },
-    relations: ['history']
-  });
+    // 2. Vérifier si l'article est archivé
+    if (article.status !== 'archived') {
+      throw new BadRequestException('article.restore_not_available');
+    }
 
-  if (!updatedArticle) {
-    throw new NotFoundException('Article non trouvé après restauration');
+    // 3. Mettre à jour le statut
+    await this.articleRepository.update(id, { 
+      status: 'active'
+    });
+
+    // 4. Récupérer l'article mis à jour
+    const updatedArticle = await this.articleRepository.findOne({
+      where: { id }
+    });
+
+    if (!updatedArticle) {
+      throw new NotFoundException('article.not_found');
+    }
+
+    return this.mapToResponseDto(updatedArticle);
+  } catch (error) {
+    if (error instanceof NotFoundException || error instanceof BadRequestException) {
+      throw error;
+    }
+    throw new InternalServerErrorException('article.restore_error');
   }
-
-  return this.mapToResponseDto(updatedArticle);
 }
 
   async findAllPaginated(

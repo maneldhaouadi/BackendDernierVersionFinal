@@ -1,4 +1,3 @@
-
 import {
   Body,
   Controller,
@@ -56,6 +55,22 @@ export class ArticleController {
   ) {}
 
 
+@Delete('/delete/:id')
+@ApiOperation({ summary: 'Soft delete an article (mark as deleted)' })
+@ApiParam({ name: 'id', description: 'Article ID to delete', type: Number })
+@ApiResponse({ 
+    status: 200, 
+    description: 'Article successfully marked as deleted',
+    type: ResponseArticleDto
+})
+async delete(
+    @Param('id', ParseIntPipe) id: number
+): Promise<ResponseArticleDto> {
+    const deletedArticle = await this.articleService.delete(id);
+    return this.mapToResponseDto(deletedArticle);
+}
+
+/*
   @Delete(':id')
 @ApiOperation({ summary: 'Soft delete an article (mark as deleted)' })
 @ApiParam({ name: 'id', description: 'Article ID to delete', type: Number })
@@ -70,7 +85,7 @@ async delete(
   const deletedArticle = await this.articleService.delete(id);
   return this.mapToResponseDto(deletedArticle);
 }
-
+*/
   @Get('active')
   @ApiOperation({ summary: 'Get all active (non-archived) articles' })
   @ApiResponse({ 
@@ -101,6 +116,7 @@ async delete(
     return this.articleService.findAllArchived();
   }
 
+
   @Post(':id/restore')
 @ApiOperation({ summary: 'Restore an archived article' })
 @ApiParam({ name: 'id', description: 'Article ID to restore' })
@@ -114,6 +130,7 @@ async restoreArticle(
 ): Promise<ResponseArticleDto> {
   return this.articleService.restoreArticle(id);
 }
+
 
  @Get(':id/check-availability')
 @ApiOperation({ summary: 'Vérifier la disponibilité d\'un article' })
@@ -191,7 +208,6 @@ async checkAvailability(
   async useInOrder(@Param('id') id: number): Promise<void> {
     return this.articleService.useInOrder(id);
   }
-
   @Post(':id/restore-version/:version')
   async restoreVersion(
     @Param('id') id: number,
@@ -199,6 +215,7 @@ async checkAvailability(
   ): Promise<ResponseArticleDto> {
     return this.articleService.restoreArticleVersion(id, version);
   }
+
 
   @Put(':id/status')
   @HttpCode(HttpStatus.OK)
@@ -874,4 +891,42 @@ async getStockValueEvolution(
     };
   }
   */
+
+  @Post(':id/restore-archived')
+  @ApiOperation({ summary: 'Restore an archived article to active status' })
+  @ApiParam({ name: 'id', description: 'ID of the archived article to restore', type: Number })
+  @ApiResponse({ 
+    status: 200, 
+    description: 'Article successfully restored to active status',
+    type: ResponseArticleDto
+  })
+  @ApiResponse({ 
+    status: 404, 
+    description: 'Article not found'
+  })
+  @ApiResponse({ 
+    status: 400, 
+    description: 'Article is not archived or cannot be restored'
+  })
+  async restoreArchivedArticle(
+    @Param('id', ParseIntPipe) id: number
+  ): Promise<ResponseArticleDto> {
+    try {
+      return await this.articleService.restoreArticle(id);
+    } catch (error) {
+      if (error instanceof NotFoundException) {
+        throw new NotFoundException('article.not_found');
+      }
+      if (error instanceof BadRequestException) {
+        throw new BadRequestException({
+          message: 'article.restore_not_available',
+          statusCode: 400
+        });
+      }
+      throw new InternalServerErrorException({
+        message: 'article.restore_error',
+        statusCode: 500
+      });
+    }
+  }
 }
