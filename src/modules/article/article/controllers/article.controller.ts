@@ -195,6 +195,7 @@ async checkAvailability(
   async useInOrder(@Param('id') id: number): Promise<void> {
     return this.articleService.useInOrder(id);
   }
+  
   @Post(':id/restore-version/:version')
   async restoreVersion(
     @Param('id') id: number,

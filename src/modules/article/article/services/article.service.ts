@@ -898,7 +898,7 @@ async findOneByReference(reference: string): Promise<ArticleEntity | null> {
     return dto;
   }
 
-  async restoreArticleVersion(articleId: number, targetVersion: number): Promise<ArticleEntity> {
+   async restoreArticleVersion(articleId: number, targetVersion: number): Promise<ArticleEntity> {
     const article = await this.findOneById(articleId);
     this.permissionService.validateAction(article.status, ArticleAction.RESTORE_VERSION);
 
@@ -923,7 +923,7 @@ async findOneByReference(reference: string): Promise<ArticleEntity | null> {
       });
 
       if (!targetVersionEntry) {
-        throw new NotFoundException(`Version ${targetVersion} non trouvée`);
+        throw new NotFoundException('Version non trouvée');
       }
 
       const restoredArticle = this.articleRepository.create({
