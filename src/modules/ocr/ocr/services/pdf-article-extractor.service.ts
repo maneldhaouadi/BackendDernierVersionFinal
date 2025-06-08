@@ -12,19 +12,64 @@ interface IPDFParser {
   removeAllListeners(event?: string): this;
 }
 
+// Suppression des avertissements avant l'import de pdf2json
+const originalConsoleWarn = console.warn;
+console.warn = (...args) => {
+  if (args[0]?.includes('TT: undefined function') || args[0]?.includes('Setting up fake worker')) {
+    return;
+  }
+  originalConsoleWarn.apply(console, args);
+};
+
 const PDFParser: IPDFParser = require('pdf2json');
+
+// Restauration de console.warn après l'import
+console.warn = originalConsoleWarn;
 
 @Injectable()
 export class PdfArticleExtractorService {
   private readonly logger = new Logger(PdfArticleExtractorService.name);
   private pdfParser: IPDFParser | null = null;
 
-  constructor() { this.initializeParser(); }
+  constructor() { 
+    this.initializeParser();
+  }
 
   private initializeParser(): void {
-    this.pdfParser = new PDFParser(null, 1);
-    this.pdfParser.on('pdfParser_dataError', err => this.logger.error('PDF Parse Error', err));
-    this.pdfParser.on('error', err => this.logger.error('PDF System Error', err));
+    try {
+      this.pdfParser = new PDFParser({
+        pagerender: this.renderPage,
+        max: 0,
+        version: 'v2.0.550',
+        worker: false // Désactive l'utilisation des workers
+      });
+
+      this.pdfParser.on('pdfParser_dataError', err => {
+        this.logger.error('PDF Parse Error', err);
+        throw new BadRequestException('Erreur lors de l\'analyse du PDF');
+      });
+
+      this.pdfParser.on('error', err => {
+        this.logger.error('PDF System Error', err);
+        throw new InternalServerErrorException('Erreur système lors du traitement du PDF');
+      });
+    } catch (error) {
+      this.logger.error('Erreur lors de l\'initialisation du parser PDF', error);
+      throw new InternalServerErrorException('Erreur lors de l\'initialisation du parser PDF');
+    }
+  }
+
+  private renderPage(pageData: any): string {
+    try {
+      return pageData.getTextContent()
+        .then((content: any) => {
+          const strings = content.items.map((item: any) => item.str);
+          return strings.join(' ');
+        });
+    } catch (error) {
+      this.logger.warn('Erreur lors du rendu de la page', error);
+      return '';
+    }
   }
 
   async extractStructuredData(pdfBuffer: Buffer, fileName: string): Promise<{
@@ -46,7 +91,16 @@ export class PdfArticleExtractorService {
     try {
       this.validatePdfBuffer(pdfBuffer);
       const rawText = await this.extractRawText(pdfBuffer);
+      
+      if (!rawText || rawText.trim().length === 0) {
+        throw new BadRequestException('Le PDF ne contient pas de texte extractible');
+      }
+
       const pages = this.splitTextToPages(rawText);
+      
+      if (pages.length === 0) {
+        throw new BadRequestException('Aucune page n\'a pu être extraite du PDF');
+      }
 
       return {
         success: true,
@@ -69,20 +123,33 @@ export class PdfArticleExtractorService {
       };
     } catch (error) {
       this.logger.error('Extraction failed', error.stack);
-      throw new BadRequestException('PDF processing failed');
+      if (error instanceof BadRequestException || error instanceof InternalServerErrorException) {
+        throw error;
+      }
+      throw new BadRequestException('Erreur lors du traitement du PDF: ' + error.message);
     }
   }
 
   private async extractRawText(pdfBuffer: Buffer): Promise<string> {
     return new Promise((resolve, reject) => {
-      this.pdfParser!.once('pdfParser_dataReady', (pdfData: IPDFData) => {
-        try {
-          resolve(this.processPdfData(pdfData));
-        } catch (error) {
-          reject(error);
-        }
-      });
-      this.pdfParser!.parseBuffer(pdfBuffer);
+      try {
+        this.pdfParser!.once('pdfParser_dataReady', (pdfData: IPDFData) => {
+          try {
+            const text = this.processPdfData(pdfData);
+            if (!text || text.trim().length === 0) {
+              reject(new BadRequestException('Aucun texte n\'a pu être extrait du PDF'));
+              return;
+            }
+            resolve(text);
+          } catch (error) {
+            reject(new BadRequestException('Erreur lors du traitement des données PDF: ' + error.message));
+          }
+        });
+
+        this.pdfParser!.parseBuffer(pdfBuffer);
+      } catch (error) {
+        reject(new BadRequestException('Erreur lors de l\'analyse du PDF: ' + error.message));
+      }
     });
   }
 
@@ -103,27 +170,65 @@ export class PdfArticleExtractorService {
 
   private parseContentToDto(text: string): ImportArticleDto {
     const extractField = (pattern: RegExp): string | undefined => {
-        const match = text.match(pattern);
-        return match?.[1]?.trim();
+      const match = text.match(pattern);
+      return match?.[1]?.trim();
     };
 
-    // Extraction spécifique pour les notes pour éviter la duplication
-    const notesMatch = text.match(/Notes\s*[:.-]?\s*(.*?)(?=\s*(?:Titre|R[ée]f[ée]rence|Description|Quantit[ée]|Prix|$))/is);
+    // Extraction du titre avec pattern amélioré
+    const titleMatch = text.match(/(?:Titre|Title)\s*[:.-]?\s*(.*?)(?=\s*(?:R[ée]f[ée]rence|Description|$))/i) ||
+                      text.match(/^([^:\n]+?)(?=\s*(?:R[ée]f[ée]rence|Description|$))/i);
+    const title = titleMatch?.[1]?.trim();
+
+    // Extraction de la référence avec pattern amélioré
+    const refMatch = text.match(/R[ée]f[ée]rence\s*[:.-]?\s*(PROD-\d{4}-\d{3,})/i) ||
+                    text.match(/PROD-\d{4}-\d{3,}/i);
+    const reference = refMatch?.[1]?.trim() || refMatch?.[0]?.trim();
+
+    // Extraction de la description avec pattern amélioré
+    const descMatch = text.match(/Description\s*[:.-]?\s*(.*?)(?=\s*(?:Prix|Quantit[ée]|Notes|$))/is) ||
+                     text.match(/(?:Description|Désignation)\s*[:.-]?\s*(.*?)(?=\s*(?:Prix|Quantit[ée]|Notes|$))/is);
+    const description = descMatch?.[1]?.trim();
+
+    // Extraction du prix avec pattern amélioré
+    const priceMatch = text.match(/(?:Prix|Price|Prix unitaire)\s*[:.-]?\s*(\d+[.,]\d{2})\s*(?:€|EUR|euros?)?/i) ||
+                      text.match(/(\d+[.,]\d{2})\s*(?:€|EUR|euros?)/i);
+    const price = priceMatch?.[1]?.replace(',', '.');
+
+    // Extraction de la quantité avec pattern amélioré
+    const qtyMatch = text.match(/(?:Quantité|Quantity|Quantité disponible)\s*[:.-]?\s*(\d+)(?:\s*(?:unités?|units?|pcs?|pièces?|pieces?))?/i) ||
+                    text.match(/(\d+)\s*(?:unités?|units?|pcs?|pièces?|pieces?)/i);
+    const quantity = qtyMatch?.[1]?.trim();
+
+    // Extraction des notes avec pattern amélioré
+    const notesMatch = text.match(/Notes\s*[:.-]?\s*(.*?)(?=\s*(?:$))/is);
     const notes = notesMatch?.[1]?.trim();
 
-    return {
-        title: extractField(/Titre\s*[:.-]?\s*(.*?)(?=\s*(?:Description|Référence|$))/i),
-        description: extractField(/Description\s*[:.-]?\s*(.*?)(?=\s*(?:R[ée]f[ée]rence|Quantit[ée]|Prix|$))/i),
-        reference: extractField(/R[ée]f[ée]rence\s*[:.-]?\s*([A-Z0-9\s-]+)(?=\s|$)/i) || '',
-        quantityInStock: this.parseNumber(extractField(/Quantit[ée]\s*(?:en stock)?\s*[:.-]?\s*(\d+)/i)),
-        unitPrice: this.parseNumber(extractField(/Prix\s*(?:unitaire)?\s*[:.-]?\s*([\d,.]+)/i)),
-        notes: notes,
-        status: 'draft'
+    // Nettoyage des valeurs
+    const cleanValue = (value?: string): string | undefined => {
+      if (!value) return undefined;
+      return value
+        .replace(/\s+/g, ' ')
+        .replace(/\s*[:.-]\s*$/, '')
+        .replace(/^\s*[:.-]\s*/, '')
+        .trim();
     };
-}
+
+    return {
+      title: cleanValue(title),
+      description: cleanValue(description),
+      reference: cleanValue(reference),
+      quantityInStock: this.parseNumber(quantity),
+      unitPrice: this.parseNumber(price),
+      notes: cleanValue(notes),
+      status: 'draft'
+    };
+  }
+
   private parseNumber(value?: string): number | undefined {
     if (!value) return undefined;
-    const num = parseFloat(value.replace(',', '.').replace(/[^\d.-]/g, ''));
+    // Supprimer tous les caractères non numériques sauf le point et la virgule
+    const cleanValue = value.replace(/[^\d.,]/g, '').replace(',', '.');
+    const num = parseFloat(cleanValue);
     return isNaN(num) ? undefined : num;
   }
 

@@ -55,6 +55,24 @@ export class ArticleController {
   ) {}
 
 
+
+
+/*
+  @Delete(':id')
+@ApiOperation({ summary: 'Soft delete an article (mark as deleted)' })
+@ApiParam({ name: 'id', description: 'Article ID to delete', type: Number })
+@ApiResponse({ 
+  status: 200, 
+  description: 'Article successfully marked as deleted',
+  type: ResponseArticleDto
+})
+async delete(
+  @Param('id', ParseIntPipe) id: number
+): Promise<ResponseArticleDto> {
+  const deletedArticle = await this.articleService.delete(id);
+  return this.mapToResponseDto(deletedArticle);
+}
+*/
   @Get('active')
   @ApiOperation({ summary: 'Get all active (non-archived) articles' })
   @ApiResponse({ 
@@ -85,6 +103,7 @@ export class ArticleController {
     return this.articleService.findAllArchived();
   }
 
+
   @Post(':id/restore')
 @ApiOperation({ summary: 'Restore an archived article' })
 @ApiParam({ name: 'id', description: 'Article ID to restore' })
@@ -98,6 +117,7 @@ async restoreArticle(
 ): Promise<ResponseArticleDto> {
   return this.articleService.restoreArticle(id);
 }
+
 
  @Get(':id/check-availability')
 @ApiOperation({ summary: 'Vérifier la disponibilité d\'un article' })
@@ -175,7 +195,6 @@ async checkAvailability(
   async useInOrder(@Param('id') id: number): Promise<void> {
     return this.articleService.useInOrder(id);
   }
-
   @Post(':id/restore-version/:version')
   async restoreVersion(
     @Param('id') id: number,
@@ -183,6 +202,7 @@ async checkAvailability(
   ): Promise<ResponseArticleDto> {
     return this.articleService.restoreArticleVersion(id, version);
   }
+
 
   @Put(':id/status')
   @HttpCode(HttpStatus.OK)
@@ -879,4 +899,18 @@ async delete(
     };
   }
   */
+@Post(':id/restore-archived')
+@ApiOperation({ summary: 'Restore an archived article' })
+@ApiParam({ name: 'id', description: 'Article ID to restore' })
+@ApiResponse({ 
+  status: 200, 
+  description: 'Article successfully restored',
+  type: ResponseArticleDto
+})
+async restoreArchivedArticle(
+  @Param('id', ParseIntPipe) id: number
+): Promise<ResponseArticleDto> {
+  const article = await this.articleService.restoreArchivedArticle(id);
+  return this.mapToResponseDto(article);
+}
 }

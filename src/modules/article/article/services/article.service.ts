@@ -39,6 +39,7 @@ export class ArticleService {
 
 
 //////
+/*
 async getActiveArticles(page: number = 1, limit: number = 10): Promise<ArticleEntity[]> {
   return this.articleRepository.find({
     where: { 
@@ -51,13 +52,103 @@ async getActiveArticles(page: number = 1, limit: number = 10): Promise<ArticleEn
     relations: ['history']
   });
 }
-
+*/
 async getArchivedArticles(page: number = 1, limit: number = 10): Promise<ArticleEntity[]> {
   return this.articleRepository.find({
     where: { 
       status: 'archived',
       deletedAt: null 
     },
+    order: { updatedAt: 'DESC' },
+    skip: (page - 1) * limit,
+    take: limit,
+    relations: ['history']
+  });
+}async delete(id: number): Promise<ArticleEntity> {
+    // 1. Trouver l'article existant
+    const article = await this.findOneById(id);
+    
+    // 2. Vérifier que l'article n'est pas déjà supprimé
+    if (article.status === 'deleted') {
+        throw new BadRequestException('Cet article est déjà marqué comme supprimé');
+    }
+
+    // 3. Vérifier les permissions de suppression
+    this.permissionService.validateAction(article.status, ArticleAction.DELETE);
+
+    // 4. Sauvegarder l'ancien statut pour l'historique
+    const previousStatus = article.status;
+
+    // 5. Mettre à jour le statut et la date de suppression
+    article.status = 'deleted';
+    article.deletedAt = new Date();
+    article.version += 1;
+    
+    // 6. Enregistrer les modifications (cela fera aussi le soft delete)
+    const deletedArticle = await this.articleRepository.save(article);
+
+    // 7. Créer une entrée d'historique
+    await this.articleHistoryService.createHistoryEntry({
+        version: deletedArticle.version,
+        changes: {
+            status: {
+                oldValue: previousStatus,
+                newValue: 'deleted'
+            },
+            deletedAt: {
+                oldValue: null,
+                newValue: deletedArticle.deletedAt
+            }
+        },
+        articleId: id,
+        snapshot: article
+    });
+
+    return deletedArticle;
+}
+
+async markAsDeleted(id: number): Promise<ArticleEntity> {
+  const article = await this.findOneById(id);
+  
+  if (article.status === 'deleted') {
+    throw new BadRequestException('Cet article est déjà marqué comme supprimé');
+  }
+
+  const previousStatus = article.status;
+  article.status = 'deleted';
+  article.deletedAt = new Date();
+  article.version += 1;
+
+  const updatedArticle = await this.articleRepository.save(article);
+
+  await this.articleHistoryService.createHistoryEntry({
+    version: updatedArticle.version,
+    changes: {
+      status: {
+        oldValue: previousStatus,
+        newValue: 'deleted'
+      },
+      deletedAt: {
+        oldValue: null,
+        newValue: updatedArticle.deletedAt
+      }
+    },
+    articleId: id,
+    snapshot: article
+  });
+
+  return updatedArticle;
+}
+
+
+async getActiveArticles(page: number = 1, limit: number = 10): Promise<ArticleEntity[]> {
+  return this.articleRepository.find({
+    where: [
+      { 
+        status: Not(In(['archived', 'deleted'])),
+        deletedAt: null
+      }
+    ],
     order: { updatedAt: 'DESC' },
     skip: (page - 1) * limit,
     take: limit,
@@ -112,23 +203,30 @@ async unarchiveArticle(id: number): Promise<ArticleEntity> {
   }
 
 
-
-  async getTopValuedArticles(): Promise<Array<{
-    reference: string;
-    title: string;
-    totalValue: number;
-  }>> {
+  async getTopValuedArticles() {
     const articles = await this.articleRepository.find({
-      where: { status: 'active' },
-      order: { quantityInStock: 'DESC' },
-      take: 5
+      where: { deletedAt: null }
     });
 
-    return articles.map(a => ({
-      reference: a.reference,
-      title: a.title || 'Sans titre',
-      totalValue: a.quantityInStock * a.unitPrice
-    }));
+    return articles
+      .map(article => {
+        const quantity = Number(article.quantityInStock);
+        const price = Number(article.unitPrice);
+        const totalValue = quantity * price;
+
+        return {
+          id: article.id,
+          reference: article.reference,
+          title: article.title || 'Sans titre',
+          totalValue: totalValue,
+          quantity: quantity,
+          unitPrice: price,
+          status: article.status
+        };
+      })
+      .filter(article => article.totalValue > 0)
+      .sort((a, b) => b.totalValue - a.totalValue)
+      .slice(0, 5);
   }
 
   async getAveragePriceByStatus(): Promise<Record<string, number>> {
@@ -152,28 +250,66 @@ async unarchiveArticle(id: number): Promise<ArticleEntity> {
   }
 
   async updateStatus(id: number, newStatus: ArticleStatus): Promise<ArticleEntity> {
+    // 1. Trouver l'article existant
     const article = await this.findOneById(id);
     
-    // Vérification des permissions
+    // 2. Vérifier que l'article n'est pas déjà supprimé
+    if (article.status === 'deleted') {
+        throw new BadRequestException('Impossible de modifier le statut d\'un article supprimé');
+    }
+
+    // 3. Vérifier les permissions
     this.permissionService.validateAction(article.status, ArticleAction.CHANGE_STATUS);
 
-    // Mise à jour simple
-    const updatePayload = {
-      status: newStatus,
-      version: article.version + 1,
-      updatedAt: new Date()
+    // 4. Sauvegarder l'ancien statut pour l'historique
+    const previousStatus = article.status;
+
+    // 5. Préparer les données de mise à jour
+    const updatePayload: Partial<ArticleEntity> = {
+        status: newStatus,
+        version: article.version + 1,
+        updatedAt: new Date()
     };
 
-    try {
-      return await this.articleRepository.save({
-        ...article,
-        ...updatePayload
-      });
-    } catch (error) {
-      this.handleSaveError(error, article.reference);
+    // 6. Si le nouveau statut est 'deleted', ajouter la date de suppression
+    if (newStatus === 'deleted') {
+        updatePayload.deletedAt = new Date();
     }
+
+    // 7. Appliquer les modifications
+    await this.articleRepository.update(id, updatePayload);
+
+    // 8. Récupérer l'article mis à jour
+    const updatedArticle = await this.articleRepository.findOne({ 
+        where: { id },
+        relations: ['history']
+    });
+
+    if (!updatedArticle) {
+        throw new NotFoundException('Article non trouvé après mise à jour du statut');
+    }
+
+    // 9. Enregistrer dans l'historique
+    await this.articleHistoryService.createHistoryEntry({
+        version: updatedArticle.version,
+        changes: {
+            status: {
+                oldValue: previousStatus,
+                newValue: newStatus
+            },
+            ...(newStatus === 'deleted' ? {
+                deletedAt: {
+                    oldValue: null,
+                    newValue: updatedArticle.deletedAt
+                }
+            } : {})
+        },
+        articleId: id,
+        snapshot: article
+    });
+
+    return updatedArticle;
 }
-  
   async suggestArchiving(): Promise<ArticleEntity[]> {
     const sixMonthsAgo = new Date();
     sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
@@ -315,30 +451,40 @@ async findAllArchived(): Promise<ResponseArticleDto[]> {
   });
   return articles.map(article => this.mapToResponseDto(article));
 }
-
-async restoreArticle(id: number): Promise<ResponseArticleDto> {
-  // 1. Restaurer le soft delete
-  await this.articleRepository.update(id, { deletedAt: null });
-
-  // 2. Mettre à jour le statut
-  await this.articleRepository.update(id, { 
-    status: 'active',
-    version: () => "version + 1"
-  });
-
-  // 3. Récupérer l'article mis à jour
-  const updatedArticle = await this.articleRepository.findOne({
-    where: { id },
-    relations: ['history']
-  });
-
-  if (!updatedArticle) {
-    throw new NotFoundException('Article non trouvé après restauration');
+async restoreArticle(id: number): Promise<ArticleEntity> {
+  // 1. Trouver l'article existant
+  const article = await this.findOneById(id);
+  
+  // 2. Vérifier que l'article est bien archivé
+  if (article.status !== 'archived') {
+    throw new BadRequestException('Seuls les articles archivés peuvent être restaurés');
   }
 
-  return this.mapToResponseDto(updatedArticle);
-}
+  // 3. Sauvegarder l'ancien statut pour l'historique
+  const previousStatus = article.status;
 
+  // 4. Mettre à jour le statut
+  article.status = 'active';
+  article.version += 1;
+  
+  // 5. Enregistrer les modifications
+  const updatedArticle = await this.articleRepository.save(article);
+
+  // 6. Enregistrer dans l'historique
+  await this.articleHistoryService.createHistoryEntry({
+    version: updatedArticle.version,
+    changes: {
+      status: {
+        oldValue: previousStatus,
+        newValue: 'active'
+      }
+    },
+    articleId: id,
+    snapshot: article
+  });
+
+  return updatedArticle;
+}
   async findAllPaginated(
     query: IQueryObject,
   ): Promise<PageDto<ResponseArticleDto>> {
@@ -868,14 +1014,32 @@ async findOneByReference(reference: string): Promise<ArticleEntity | null> {
 
   async getSimpleStats() {
     const allArticles = await this.articleRepository.find({
-      where: { deletedAt: null }
+      where: { deletedAt: null } // Exclure les articles supprimés
+    });
+    
+    console.log('Nombre total d\'articles:', allArticles.length);
+    
+    // Vérification des articles avec prix et quantités
+    const articlesWithValues = allArticles.filter(a => 
+      (Number(a.quantityInStock) || 0) > 0 && 
+      (Number(a.unitPrice) || 0) > 0
+    );
+    
+    console.log('Articles avec prix et quantités:', articlesWithValues.length);
+    console.log('Détail des articles avec valeurs:');
+    articlesWithValues.forEach(a => {
+      console.log(`- ${a.reference}: Quantité=${a.quantityInStock}, Prix=${a.unitPrice}`);
     });
     
     const totalValue = allArticles.reduce((sum, a) => {
       const quantity = Number(a.quantityInStock) || 0;
       const price = Number(a.unitPrice) || 0;
-      return sum + (quantity * price);
+      const articleValue = quantity * price;
+      console.log(`Article ${a.reference}: Quantité=${quantity}, Prix=${price}, Valeur=${articleValue}`);
+      return sum + articleValue;
     }, 0);
+    
+    console.log('Valeur totale calculée:', totalValue);
     
     const stats = {
       totalArticles: allArticles.length,
@@ -885,20 +1049,25 @@ async findOneByReference(reference: string): Promise<ArticleEntity | null> {
         a.status === 'out_of_stock' || Number(a.quantityInStock) <= 0
       ).length,
       totalValue: totalValue,
-      averageStockPerArticle: allArticles.length > 0 ? totalValue / allArticles.length : 0,
+      averageStockPerArticle: 0,
       lowStockCount: allArticles.filter(a => 
         Number(a.quantityInStock) > 0 && Number(a.quantityInStock) <= 5
       ).length,
-      topStockValueArticles: allArticles
-        .filter(a => Number(a.quantityInStock) > 0)
-        .map(a => ({
-          reference: a.reference,
-          title: a.title || 'Sans titre',
-          value: Number(a.quantityInStock) * Number(a.unitPrice),
-          status: a.status
-        }))
-        .sort((a, b) => b.value - a.value)
-        .slice(0, 5)
+      topStockValueArticles: [] as Array<{
+        reference: string;
+        title: string;
+        value: number;
+        status: string;
+      }>,
+      toArchiveSuggestions: [] as string[],
+      stockHealth: {
+        activeWithStock: allArticles.filter(a => 
+          a.status === 'active' && a.quantityInStock > 0
+        ).length,
+        inactiveWithStock: allArticles.filter(a => 
+          a.status !== 'active' && a.quantityInStock > 0
+        ).length
+      }
     };
 
     // Calcul des comptages par statut
@@ -911,6 +1080,34 @@ async findOneByReference(reference: string): Promise<ArticleEntity | null> {
       stats.statusPercentages[status] = 
         ((stats.statusCounts[status] / stats.totalArticles) * 100).toFixed(2) + '%';
     }
+
+    // Calcul de la moyenne du stock par article
+    stats.averageStockPerArticle = stats.totalArticles > 0 
+      ? stats.totalValue / stats.totalArticles 
+      : 0;
+
+    // Articles les plus valorisés
+    stats.topStockValueArticles = allArticles
+      .filter(a => a.quantityInStock > 0)
+      .map(a => ({
+        reference: a.reference,
+        title: a.title || 'Sans titre',
+        value: (Number(a.quantityInStock) || 0) * (Number(a.unitPrice) || 0),
+        status: a.status
+      }))
+      .sort((a, b) => b.value - a.value)
+      .slice(0, 5);
+
+    // Suggestions d'archivage
+    const sixMonthsAgo = new Date();
+    sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
+    
+    stats.toArchiveSuggestions = allArticles
+      .filter(a => 
+        (a.status === 'inactive' || a.status === 'out_of_stock') && 
+        a.updatedAt < sixMonthsAgo
+      )
+      .map(a => a.reference);
 
     return stats;
   }
@@ -964,7 +1161,7 @@ async findOneByReference(reference: string): Promise<ArticleEntity | null> {
 
   async getStatusOverview() {
     const allArticles = await this.articleRepository.find({
-      where: { deletedAt: null }
+      where: { deletedAt: null } // Exclure les articles supprimés
     });
     
     const counts = {
@@ -1011,7 +1208,7 @@ async findOneByReference(reference: string): Promise<ArticleEntity | null> {
     details: Record<string, number>;
   }> {
     const allArticles = await this.articleRepository.find({
-      where: { deletedAt: null }
+      where: { deletedAt: null } // Exclure les articles supprimés
     });
     
     const statusCounts = {};
@@ -1156,199 +1353,131 @@ async findOneByReference(reference: string): Promise<ArticleEntity | null> {
   }
 }
 
-
-async delete(id: number): Promise<ArticleEntity> {
-    // 1. Trouver l'article existant
-    const article = await this.findOneById(id);
-    
-    // 2. Vérifier que l'article n'est pas déjà supprimé
-    if (article.status === 'deleted') {
-        throw new BadRequestException('Cet article est déjà marqué comme supprimé');
-    }
-
-    // 3. Vérifier les permissions de suppression
-    this.permissionService.validateAction(article.status, ArticleAction.DELETE);
-
-    // 4. Sauvegarder l'ancien statut pour l'historique
-    const previousStatus = article.status;
-
-    // 5. Mettre à jour le statut et la date de suppression
-    article.status = 'deleted';
-    article.deletedAt = new Date();
-    article.version += 1;
-    
-    // 6. Enregistrer les modifications (cela fera aussi le soft delete)
-    const deletedArticle = await this.articleRepository.save(article);
-
-    // 7. Créer une entrée d'historique
-    await this.articleHistoryService.createHistoryEntry({
-        version: deletedArticle.version,
-        changes: {
-            status: {
-                oldValue: previousStatus,
-                newValue: 'deleted'
-            },
-            deletedAt: {
-                oldValue: null,
-                newValue: deletedArticle.deletedAt
-            }
-        },
-        articleId: id,
-        snapshot: article
-    });
-
-    return deletedArticle;
+async restoreArchivedArticle(id: number): Promise<ArticleEntity> {
+  const article = await this.findOneById(id);
+  if (!article) {
+    throw new NotFoundException('Article not found');
+  }
+  
+  if (article.status !== 'archived') {
+    throw new BadRequestException('Article is not archived');
+  }
+  
+  return this.restoreArticle(id);
 }
 
-async markAsDeleted(id: number): Promise<ArticleEntity> {
-  const article = await this.findOneById(id);
-  
-  if (article.status === 'deleted') {
-    throw new BadRequestException('Cet article est déjà marqué comme supprimé');
-  }
-
-  const previousStatus = article.status;
-  article.status = 'deleted';
-  article.deletedAt = new Date();
-  article.version += 1;
-
-  const updatedArticle = await this.articleRepository.save(article);
-
-  await this.articleHistoryService.createHistoryEntry({
-    version: updatedArticle.version,
-    changes: {
-      status: {
-        oldValue: previousStatus,
-        newValue: 'deleted'
-      },
-      deletedAt: {
-        oldValue: null,
-        newValue: updatedArticle.deletedAt
-      }
-    },
-    articleId: id,
-    snapshot: article
+async getArticleQualityScores() {
+  const articles = await this.articleRepository.find({
+    where: { deletedAt: null }
   });
 
-  return updatedArticle;
+  return articles.map(article => {
+    const score = this.calculateQualityScore(article);
+    return {
+      id: article.id,
+      reference: article.reference,
+      title: article.title || 'Sans titre',
+      score: score,
+      details: {
+        hasDescription: Boolean(article.description),
+        hasPrice: Number(article.unitPrice) > 0,
+        hasStock: Number(article.quantityInStock) > 0,
+        isActive: article.status === 'active'
+      }
+    };
+  });
 }
 
-// Ajout des méthodes pour les stats avancées
-async getArticleQualityScores(): Promise<{
-  scores: Array<{
-    id: number;
-    reference: string;
-    title?: string;
-    score: number;
-    missingFields: string[];
-  }>;
-  incompleteArticles: Array<{
-    id: number;
-    reference: string;
-    title?: string;
-    score: number;
-  }>;
-}> {
-  const allArticles = await this.articleRepository.find({ where: { deletedAt: null } });
+private calculateQualityScore(article: ArticleEntity): number {
+  let score = 0;
   
-  const results = allArticles.map(article => {
-    const missingFields = [];
-    let score = 0;
+  // Vérification de la description
+  if (article.description && article.description.length > 0) {
+    score += 25;
+  }
+  
+  // Vérification du prix
+  if (Number(article.unitPrice) > 0) {
+    score += 25;
+  }
+  
+  // Vérification du stock
+  if (Number(article.quantityInStock) > 0) {
+    score += 25;
+  }
+  
+  // Vérification du statut
+  if (article.status === 'active') {
+    score += 25;
+  }
+  
+  return score;
+}
 
-    if (article.description) score += 25; else missingFields.push('description');
-    if (article.justificatifFile) score += 25; else missingFields.push('justificatif');
-    if (article.notes) score += 25; else missingFields.push('notes');
-    if (Number(article.quantityInStock) > 0) score += 25; else missingFields.push('stock');
+async detectSuspiciousArticles() {
+  const articles = await this.articleRepository.find({
+    where: { deletedAt: null }
+  });
+
+  return articles.filter(article => {
+    const unitPrice = Number(article.unitPrice);
+    const quantityInStock = Number(article.quantityInStock);
+    
+    // Articles avec prix anormalement bas
+    const hasSuspiciousPrice = unitPrice > 0 && unitPrice < 1;
+    
+    // Articles avec stock anormalement élevé
+    const hasSuspiciousStock = quantityInStock > 1000;
+    
+    // Articles sans description
+    const hasNoDescription = !article.description || article.description.length === 0;
+    
+    // Articles inactifs avec stock
+    const isInactiveWithStock = article.status !== 'active' && quantityInStock > 0;
+
+    return hasSuspiciousPrice || hasSuspiciousStock || hasNoDescription || isInactiveWithStock;
+  }).map(article => ({
+    id: article.id,
+    reference: article.reference,
+    title: article.title || 'Sans titre',
+    reasons: [
+      Number(article.unitPrice) < 1 ? 'Prix anormalement bas' : null,
+      Number(article.quantityInStock) > 1000 ? 'Stock anormalement élevé' : null,
+      (!article.description || article.description.length === 0) ? 'Pas de description' : null,
+      (article.status !== 'active' && Number(article.quantityInStock) > 0) ? 'Inactif avec stock' : null
+    ].filter(Boolean)
+  }));
+}
+
+async comparePriceTrends() {
+  const articles = await this.articleRepository.find({
+    where: { deletedAt: null },
+    relations: ['history']
+  });
+
+  return articles.map(article => {
+    const priceHistory = article.history
+      ?.filter(h => h.changes?.unitPrice)
+      .map(h => ({
+        date: h.date,
+        price: Number(h.changes.unitPrice.newValue)
+      }))
+      .sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
+
+    const currentPrice = Number(article.unitPrice);
+    const firstPrice = priceHistory?.[0]?.price || currentPrice;
+    const priceChange = firstPrice > 0 
+      ? ((currentPrice - firstPrice) / firstPrice) * 100 
+      : 0;
 
     return {
       id: article.id,
       reference: article.reference,
-      title: article.title,
-      score,
-      missingFields
+      title: article.title || 'Sans titre',
+      currentPrice: currentPrice,
+      priceHistory: priceHistory || [],
+      priceChange: priceChange
     };
   });
-
-  return {
-    scores: results,
-    incompleteArticles: results
-      .filter(item => item.score < 100)
-      .sort((a, b) => a.score - b.score)
-  };
 }
-
-async detectSuspiciousArticles(): Promise<{
-  zeroPrice: Array<{ id: number; reference: string; title?: string }>;
-  highStock: Array<{ id: number; reference: string; title?: string; quantity: number }>;
-  invalidReference: Array<{ id: number; reference: string; title?: string }>;
-}> {
-  const allArticles = await this.articleRepository.find({ where: { deletedAt: null } });
-  const referenceRegex = /^[A-Z0-9]{3,}-[0-9]{3,}$/;
-
-  return {
-    zeroPrice: allArticles
-      .filter(a => Number(a.unitPrice) === 0)
-      .map(a => ({ id: a.id, reference: a.reference, title: a.title })),
-
-    highStock: allArticles
-      .filter(a => Number(a.quantityInStock) > 10000)
-      .map(a => ({ 
-        id: a.id, 
-        reference: a.reference, 
-        title: a.title, 
-        quantity: Number(a.quantityInStock) 
-      })),
-
-    invalidReference: allArticles
-      .filter(a => !referenceRegex.test(a.reference))
-      .map(a => ({ id: a.id, reference: a.reference, title: a.title }))
-  };
-}
-
-async comparePriceTrends(): Promise<{
-  oldArticles: {
-    count: number;
-    averagePrice: number;
-  };
-  newArticles: {
-    count: number;
-    averagePrice: number;
-  };
-  priceEvolution: {
-    amount: number;
-    percentage: number;
-    trend: 'up' | 'down' | 'stable';
-  };
-}> {
-  const oneYearAgo = new Date();
-  oneYearAgo.setFullYear(oneYearAgo.getFullYear() - 1);
-
-  const allArticles = await this.articleRepository.find({ where: { deletedAt: null } });
-  
-  const oldArticles = allArticles.filter(a => a.createdAt < oneYearAgo);
-  const newArticles = allArticles.filter(a => a.createdAt >= oneYearAgo);
-
-  const avgOld = oldArticles.reduce((sum, a) => sum + Number(a.unitPrice), 0) / (oldArticles.length || 1);
-  const avgNew = newArticles.reduce((sum, a) => sum + Number(a.unitPrice), 0) / (newArticles.length || 1);
-
-  const amountDiff = avgNew - avgOld;
-  const percentDiff = avgOld !== 0 ? (amountDiff / avgOld) * 100 : 0;
-
-  return {
-    oldArticles: {
-      count: oldArticles.length,
-      averagePrice: parseFloat(avgOld.toFixed(2))
-    },
-    newArticles: {
-      count: newArticles.length,
-      averagePrice: parseFloat(avgNew.toFixed(2))
-    },
-    priceEvolution: {
-      amount: parseFloat(amountDiff.toFixed(2)),
-      percentage: parseFloat(percentDiff.toFixed(2)),
-      trend: amountDiff > 0 ? 'up' : amountDiff < 0 ? 'down' : 'stable'
-    }
-  };
-}
-
 }
