@@ -449,365 +449,277 @@ async save(createQuotationDto: CreateExpensQuotationDto): Promise<ExpensQuotatio
       status,
     });
   }
-
-  async update(
-    id: number,
-    updateQuotationDto: UpdateExpensQuotationDto
+@Transactional()
+async update(
+  id: number,
+  updateQuotationDto: UpdateExpensQuotationDto
 ): Promise<ExpensQuotationEntity> {
-    return this.entityManager.transaction(async (transactionalEntityManager) => {
-        // 1. Récupérer la quotation existante avec toutes les relations
-        const existingQuotation = await transactionalEntityManager.findOne(
-            ExpensQuotationEntity,
-            {
-                where: { id },
-                relations: [
-                    'expensearticleQuotationEntries',
-                    'expensearticleQuotationEntries.article',
-                    'expensequotationMetaData',
-                    'uploads',
-                    'uploadPdfField'
-                ]
-            }
+  return this.entityManager.transaction(async (transactionalEntityManager) => {
+    try {
+      // 1. Charger le devis existant avec toutes ses relations
+      const quotation = await transactionalEntityManager.findOne(ExpensQuotationEntity, {
+        where: { id },
+        relations: ['uploads', 'uploads.upload']
+      });
+
+      if (!quotation) {
+        throw new QuotationNotFoundException();
+      }
+
+      // 2. Cloner les uploads existants pour référence
+      const existingUploads = [...(quotation.uploads || [])];
+      const existingUploadIds = new Set(existingUploads.map(u => u.uploadId));
+
+      // 3. Traitement des fichiers
+      if (updateQuotationDto.uploads) {
+        const currentUploadIds = new Set(updateQuotationDto.uploads.map(u => u.uploadId));
+
+        // a. Désassocier les fichiers supprimés
+        const uploadsToDisassociate = existingUploads.filter(
+          u => !currentUploadIds.has(u.uploadId)
         );
 
-        if (!existingQuotation) {
-            throw new NotFoundException("Quotation not found");
+        if (uploadsToDisassociate.length > 0) {
+          await transactionalEntityManager.remove(
+            ExpensQuotationUploadEntity, 
+            uploadsToDisassociate
+          );
         }
 
-        // 2. Valider les références des articles
-        if (updateQuotationDto.articleQuotationEntries) {
-            const references = new Set<string>();
-            for (const entry of updateQuotationDto.articleQuotationEntries) {
-                if (!entry.reference) {
-                    throw new BadRequestException('Article reference is required');
-                }
-                if (references.has(entry.reference)) {
-                    throw new BadRequestException(`Duplicate article reference: ${entry.reference}`);
-                }
-                references.add(entry.reference);
-            }
-        }
-
-        // 3. Vérifier les entités associées
-        const [firm, bankAccount, currency, interlocutor] = await Promise.all([
-            this.firmService.findOneByCondition({ filter: `id||$eq||${updateQuotationDto.firmId}` }),
-            updateQuotationDto.bankAccountId 
-                ? this.bankAccountService.findOneById(updateQuotationDto.bankAccountId) 
-                : Promise.resolve(null),
-            updateQuotationDto.currencyId 
-                ? this.currencyService.findOneById(updateQuotationDto.currencyId) 
-                : Promise.resolve(null),
-            updateQuotationDto.interlocutorId 
-                ? this.interlocutorService.findOneById(updateQuotationDto.interlocutorId) 
-                : Promise.resolve(null),
-        ]);
-
-        if (!firm) {
-            throw new NotFoundException('Firm not found');
-        }
-
-        // 4. Gestion des entrées d'article
-        let articleEntries: ArticleExpensQuotationEntryEntity[] = [];
-        const entriesToDeleteIds: number[] = [];
-
-        if (updateQuotationDto.articleQuotationEntries) {
-            const existingEntries = existingQuotation.expensearticleQuotationEntries || [];
-
-            // Identifier les entrées à supprimer
-            entriesToDeleteIds.push(
-                ...existingEntries
-                    .filter(existingEntry => 
-                        !updateQuotationDto.articleQuotationEntries.some(
-                            newEntry => newEntry.id === existingEntry.id
-                        )
-                    )
-                    .map(entry => entry.id)
-            );
-
-            // Traiter chaque entrée
-            articleEntries = await Promise.all(
-                updateQuotationDto.articleQuotationEntries.map(async entry => {
-                    // Trouver l'entrée existante correspondante
-                    const existingEntry = existingEntries.find(e => e.id === entry.id);
-
-                    if (existingEntry) {
-                        // Mise à jour d'une entrée existante
-                        return this.expensearticleQuotationEntryService.update(
-                            existingEntry.id,
-                            {
-                                ...entry,
-                                expenseQuotationId: id,
-                                // Conserver l'articleId existant s'il n'est pas fourni
-                                articleId: entry.articleId ?? existingEntry.articleId
-                            }
-                        );
-                    } else {
-                        // Création d'une nouvelle entrée
-                        const articleTitle = entry.title || entry.article?.title;
-                        if (!articleTitle) {
-                            throw new BadRequestException(
-                                'Article title is required for new entries (provide either title or article.title)'
-                            );
-                        }
-
-                        // Chercher d'abord l'article par référence
-                        let article = await this.articleService.findOneByReference(entry.reference);
-
-                        if (!article) {
-                            // Créer un nouvel article si non trouvé
-                            article = await this.articleService.save({
-                                title: articleTitle,
-                                description: entry.description || entry.article?.description || '',
-                                reference: entry.reference,
-                                unitPrice: entry.unit_price || 0,
-                                quantityInStock: entry.quantity || 0,
-                                status: 'draft'
-                            });
-                        }
-
-                        // Créer la nouvelle entrée de devis
-                        return this.expensearticleQuotationEntryService.save({
-                            ...entry,
-                            expenseQuotationId: id,
-                            articleId: article.id
-                        });
-                    }
-                })
-            );
-        }
-
-        // 5. Supprimer les entrées marquées pour suppression
-        if (entriesToDeleteIds.length > 0) {
-            await this.expensearticleQuotationEntryService.softDeleteMany(entriesToDeleteIds);
-        }
-
-        // 6. Calculer les totaux
-        const { subTotal, total } = this.calculationsService.calculateLineItemsTotal(
-            articleEntries.map(entry => entry.total),
-            articleEntries.map(entry => entry.subTotal)
-        );
-
-        const totalAfterGeneralDiscount = this.calculationsService.calculateTotalDiscount(
-            total,
-            updateQuotationDto.discount,
-            updateQuotationDto.discount_type,
-        );
-
-        // 7. Gestion du résumé des taxes
-        let taxSummary = [];
-        if (articleEntries.length > 0) {
-            const lineItems = await this.expensearticleQuotationEntryService.findManyAsLineItem(
-                articleEntries.map(entry => entry.id)
-            );
-            
-            taxSummary = await Promise.all(
-                this.calculationsService.calculateTaxSummary(lineItems).map(async item => {
-                    const tax = await this.taxService.findOneById(item.taxId);
-                    return {
-                        ...item,
-                        label: tax?.label || 'Unknown',
-                        rate: tax?.isRate ? tax.value * 100 : tax?.value || 0,
-                        isRate: tax?.isRate || false
-                    };
-                })
-            );
-        }
-
-        // 8. Mettre à jour les métadonnées
-        const expensequotationMetaData = await this.expensequotationMetaDataService.save({
-            ...existingQuotation.expensequotationMetaData,
-            ...updateQuotationDto.expensequotationMetaData,
-            taxSummary
+        // b. Associer les nouveaux fichiers
+        const uploadsToAssociate = updateQuotationDto.uploads.filter(uploadDto => {
+          return !('id' in uploadDto) || !existingUploadIds.has(uploadDto.uploadId);
         });
 
-        // 9. Valider le format du numéro séquentiel
-        const sequentialNumbr = updateQuotationDto.sequentialNumbr || existingQuotation.sequential;
-        if (sequentialNumbr && !/^QUO-\d+$/.test(sequentialNumbr)) {
-            throw new BadRequestException('Invalid quotation number format. Expected format: QUO-XXXX');
+        if (uploadsToAssociate.length > 0) {
+          const newAssociations = uploadsToAssociate.map(uploadDto =>
+            transactionalEntityManager.create(ExpensQuotationUploadEntity, {
+              expensequotationId: id,
+              uploadId: uploadDto.uploadId
+            })
+          );
+          await transactionalEntityManager.save(newAssociations);
         }
-
-        // 10. Gestion du fichier PDF
-        let pdfFileId = existingQuotation.pdfFileId;
-        if (updateQuotationDto.pdfFileId && updateQuotationDto.pdfFileId !== existingQuotation.pdfFileId) {
-            if (existingQuotation.pdfFileId) {
-                await this.storageService.delete(existingQuotation.pdfFileId);
-            }
-            pdfFileId = updateQuotationDto.pdfFileId;
-        }
-
-        // 11. Gestion des fichiers uploadés
-        let uploads: ExpensQuotationUploadEntity[] = [...(existingQuotation.uploads || [])];
-        if (updateQuotationDto.uploads) {
-            uploads = uploads.filter(upload => 
-                updateQuotationDto.uploads.some(u => u.uploadId === upload.uploadId)
-            );
-
-            const newUploadDtos = updateQuotationDto.uploads.filter(
-                u => !uploads.some(existing => existing.uploadId === u.uploadId)
-            );
-
-            if (newUploadDtos.length > 0) {
-                const newUploads = await Promise.all(
-                    newUploadDtos.map(uploadDto => 
-                        this.expensequotationUploadService.create({
-                            expensequotationId: id,
-                            uploadId: uploadDto.uploadId
-                        })
-                    )
-                );
-                uploads.push(...newUploads);
-            }
-        }
-
-        // 12. Sauvegarder la quotation mise à jour
-        const updatedQuotation = await transactionalEntityManager.save(
-            ExpensQuotationEntity,
-            {
-                ...existingQuotation,
-                ...updateQuotationDto,
-                sequential: sequentialNumbr,
-                bankAccountId: bankAccount?.id ?? null,
-                currencyId: currency?.id ?? firm.currencyId,
-                interlocutorId: interlocutor?.id ?? null,
-                expensearticleQuotationEntries: articleEntries,
-                expensequotationMetaData,
-                subTotal,
-                total: totalAfterGeneralDiscount,
-                pdfFileId,
-                uploads
-            }
-        );
-
-        return updatedQuotation;
-    });
-}
-
-async duplicate(
-  duplicateQuotationDto: DuplicateExpensQuotationDto,
-): Promise<ResponseExpensQuotationDto> {
-  try {
-    // 1. Récupération stricte du devis original
-    const original = await this.expensequotationRepository.findOne({
-      where: { id: duplicateQuotationDto.id },
-      relations: [
-        'expensequotationMetaData',
-        'expensearticleQuotationEntries',
-        'uploads',
-        'uploadPdfField'
-      ],
-    });
-
-    if (!original) throw new Error("Original quotation not found");
-
-    console.log(`[DUPLICATION] IncludeFiles: ${duplicateQuotationDto.includeFiles}, Original PDF: ${original.uploadPdfField?.id || 'none'}`);
-
-    // 2. Nettoyage COMPLET des références fichiers
-    const baseData = {
-      ...original,
-      id: undefined,
-      createdAt: undefined,
-      updatedAt: undefined,
-      sequential: null,
-      sequentialNumbr: null,
-      status: EXPENSQUOTATION_STATUS.Draft,
-      // Métadonnées toujours dupliquées
-      expensequotationMetaData: await this.expensequotationMetaDataService.duplicate(
-        original.expensequotationMetaData.id
-      ),
-      // Articles toujours dupliqués
-      expensearticleQuotationEntries: [],
-      // Fichiers TOUJOURS initialisés à vide/null
-      uploads: [], // <-- Important
-      uploadPdfField: null, // <-- Critique
-      pdfFileId: null // <-- Essentiel
-    };
-
-    // 3. Création du nouveau devis (sans fichiers)
-    const newQuotation = await this.expensequotationRepository.save(baseData);
-
-    // 4. Duplication conditionnelle STRICTE
-    let finalUploads = [];
-    let finalPdf = null;
-
-    if (duplicateQuotationDto.includeFiles) {
-      console.log("[DUPLICATION] Processing files...");
-      
-      // a. Uploads réguliers
-      if (original.uploads?.length > 0) {
-        finalUploads = await this.expensequotationUploadService.duplicateMany(
-          original.uploads.map(u => u.id),
-          newQuotation.id
-        );
       }
 
-      // b. PDF - UNIQUEMENT si includeFiles=true ET PDF existant
-      if (original.uploadPdfField) {
-        console.log(`[DUPLICATION] Attempting PDF duplication from ${original.uploadPdfField.id}`);
-        finalPdf = await this.storageService.duplicate(original.uploadPdfField.id);
-      }
-    }
-
-    // 5. Mise à jour FINALE avec vérification
-    const result = await this.expensequotationRepository.save({
-      ...newQuotation,
-      expensearticleQuotationEntries: await this.expensearticleQuotationEntryService.duplicateMany(
-        original.expensearticleQuotationEntries.map(e => e.id),
-        newQuotation.id
-      ),
-      uploads: finalUploads,
-      uploadPdfField: finalPdf, // Reste null si includeFiles=false
-      pdfFileId: finalPdf?.id || null // Garanti null si includeFiles=false
-    });
-
-    // Vérification de cohérence
-    if (!duplicateQuotationDto.includeFiles && result.pdfFileId) {
-      console.error("[ERROR] PDF was duplicated despite includeFiles=false!");
-      // Correction automatique si nécessaire
-      await this.expensequotationRepository.update(result.id, {
-        uploadPdfField: null,
-        pdfFileId: null
+      // 4. Mise à jour des autres champs (sans les uploads)
+      const { uploads, ...updateDataWithoutUploads } = updateQuotationDto;
+      const updatedQuotation = await transactionalEntityManager.save(ExpensQuotationEntity, {
+        ...quotation,
+        ...updateDataWithoutUploads,
+        id: quotation.id,
       });
-      result.uploadPdfField = null;
-      result.pdfFileId = null;
+
+      // 5. Recharger le devis avec les relations fraîches
+      return await transactionalEntityManager.findOne(ExpensQuotationEntity, {
+        where: { id },
+        relations: ['uploads', 'uploads.upload']
+      });
+
+    } catch (error) {
+      console.error('Update failed:', error);
+      throw new Error('Failed to update quotation while preserving files');
+    }
+  });
+}
+
+async updateExpenseQuotationUpload(
+  id: number,
+  updateQuotationDto: UpdateExpensQuotationDto,
+  existingUploads: { id?: number; uploadId: number }[]
+) {
+  const newUploads = [];
+  const keptUploads = [...existingUploads];
+  const eliminatedUploads = [];
+
+  if (!updateQuotationDto.uploads) {
+    return { keptUploads, newUploads, eliminatedUploads };
+  }
+
+  // 1. Identifier tous les uploadIds dans la requête
+  const requestUploadIds = new Set(updateQuotationDto.uploads.map(u => u.uploadId));
+
+  // 2. Pour chaque upload dans la requête
+  for (const upload of updateQuotationDto.uploads) {
+    // Vérifier si l'upload existe déjà dans le devis
+    const existingUpload = existingUploads.find(u => u.uploadId === upload.uploadId);
+    
+    if (!existingUpload) {
+      try {
+        // Si l'upload n'existe pas, l'ajouter
+        const newUpload = await this.expensequotationUploadService.create({
+          expensequotationId: id,
+          uploadId: upload.uploadId
+        });
+        newUploads.push({
+          id: newUpload.id,
+          uploadId: newUpload.uploadId,
+        });
+      } catch (error) {
+        console.error(`Échec de l'ajout du fichier ${upload.uploadId}:`, error);
+        throw error;
+      }
+    } else {
+      // Si l'upload existe mais n'est pas encore associé (expensequotationId = NULL)
+      // On doit le mettre à jour
+      if (!existingUpload.id) {
+        const updatedUpload = await this.expensequotationUploadService.create({
+          expensequotationId: id,
+          uploadId: upload.uploadId
+        });
+        keptUploads.push({
+          id: updatedUpload.id,
+          uploadId: updatedUpload.uploadId,
+        });
+      }
+    }
+  }
+
+  // 3. Identifier les uploads à supprimer (ceux qui ne sont plus dans la requête)
+  const keptUploadIds = new Set([...keptUploads, ...newUploads].map(u => u.uploadId));
+  for (const existingUpload of existingUploads) {
+    if (!requestUploadIds.has(existingUpload.uploadId)) {
+      eliminatedUploads.push(existingUpload);
+      if (existingUpload.id) {
+        await this.expensequotationUploadService.softDelete(existingUpload.id);
+      }
+    }
+  }
+
+  return { 
+    keptUploads: [...keptUploads.filter(u => !eliminatedUploads.some(eu => eu.uploadId === u.uploadId)), 
+    newUploads,
+    eliminatedUploads
+  ]};
+}
+
+  async duplicate(
+    duplicateQuotationDto: DuplicateExpensQuotationDto,
+  ): Promise<ResponseExpensQuotationDto> {
+    try {
+      // 1. Récupération stricte du devis original
+      const original = await this.expensequotationRepository.findOne({
+        where: { id: duplicateQuotationDto.id },
+        relations: [
+          'expensequotationMetaData',
+          'expensearticleQuotationEntries',
+          'uploads',
+          'uploadPdfField'
+        ],
+      });
+
+      if (!original) throw new Error("Original quotation not found");
+
+      console.log(`[DUPLICATION] IncludeFiles: ${duplicateQuotationDto.includeFiles}, Original PDF: ${original.uploadPdfField?.id || 'none'}`);
+
+      // 2. Nettoyage COMPLET des références fichiers
+      const baseData = {
+        ...original,
+        id: undefined,
+        createdAt: undefined,
+        updatedAt: undefined,
+        sequential: null,
+        sequentialNumbr: null,
+        status: EXPENSQUOTATION_STATUS.Draft,
+        // Métadonnées toujours dupliquées
+        expensequotationMetaData: await this.expensequotationMetaDataService.duplicate(
+          original.expensequotationMetaData.id
+        ),
+        // Articles toujours dupliqués
+        expensearticleQuotationEntries: [],
+        // Fichiers TOUJOURS initialisés à vide/null
+        uploads: [], // <-- Important
+        uploadPdfField: null, // <-- Critique
+        pdfFileId: null // <-- Essentiel
+      };
+
+      // 3. Création du nouveau devis (sans fichiers)
+      const newQuotation = await this.expensequotationRepository.save(baseData);
+
+      // 4. Duplication conditionnelle STRICTE
+      let finalUploads = [];
+      let finalPdf = null;
+
+      if (duplicateQuotationDto.includeFiles) {
+        console.log("[DUPLICATION] Processing files...");
+        
+        // a. Uploads réguliers
+        if (original.uploads?.length > 0) {
+          finalUploads = await this.expensequotationUploadService.duplicateMany(
+            original.uploads.map(u => u.id),
+            newQuotation.id
+          );
+        }
+
+        // b. PDF - UNIQUEMENT si includeFiles=true ET PDF existant
+        if (original.uploadPdfField) {
+          console.log(`[DUPLICATION] Attempting PDF duplication from ${original.uploadPdfField.id}`);
+          finalPdf = await this.storageService.duplicate(original.uploadPdfField.id);
+        }
+      }
+
+      // 5. Mise à jour FINALE avec vérification
+      const result = await this.expensequotationRepository.save({
+        ...newQuotation,
+        expensearticleQuotationEntries: await this.expensearticleQuotationEntryService.duplicateMany(
+          original.expensearticleQuotationEntries.map(e => e.id),
+          newQuotation.id
+        ),
+        uploads: finalUploads,
+        uploadPdfField: finalPdf, // Reste null si includeFiles=false
+        pdfFileId: finalPdf?.id || null // Garanti null si includeFiles=false
+      });
+
+      // Vérification de cohérence
+      if (!duplicateQuotationDto.includeFiles && result.pdfFileId) {
+        console.error("[ERROR] PDF was duplicated despite includeFiles=false!");
+        // Correction automatique si nécessaire
+        await this.expensequotationRepository.update(result.id, {
+          uploadPdfField: null,
+          pdfFileId: null
+        });
+        result.uploadPdfField = null;
+        result.pdfFileId = null;
+      }
+
+      console.log("[DUPLICATION] Completed:", {
+        newId: result.id,
+        hasPdf: !!result.pdfFileId,
+        expectedPdf: duplicateQuotationDto.includeFiles
+      });
+
+      return result;
+
+    } catch (error) {
+      console.error("[DUPLICATION FAILED]", {
+        error: error.message,
+        dto: duplicateQuotationDto,
+        stack: error.stack
+      });
+      throw error;
+    }
+  }
+
+  async deletePdfFile(quotationId: number): Promise<void> {
+    const quotation = await this.expensequotationRepository.findOneById(quotationId);
+    if (!quotation) {
+      throw new Error("Quotation not found");
     }
 
-    console.log("[DUPLICATION] Completed:", {
-      newId: result.id,
-      hasPdf: !!result.pdfFileId,
-      expectedPdf: duplicateQuotationDto.includeFiles
-    });
+    if (quotation.pdfFileId) {
+      // Supprimer le fichier PDF de la base de données
+      await this.storageService.delete(quotation.pdfFileId);
 
-    return result;
-
-  } catch (error) {
-    console.error("[DUPLICATION FAILED]", {
-      error: error.message,
-      dto: duplicateQuotationDto,
-      stack: error.stack
-    });
-    throw error;
-  }
-}
-// Dans votre service backend (expensquotation.service.ts)
-async deletePdfFile(quotationId: number): Promise<void> {
-  const quotation = await this.expensequotationRepository.findOneById(quotationId);
-  if (!quotation) {
-    throw new Error("Quotation not found");
+      // Mettre à jour le devis pour retirer l'ID du fichier PDF
+      await this.expensequotationRepository.save({
+        ...quotation,
+        pdfFileId: null,
+        uploadPdfField: null,
+      });
+    }
   }
 
-  if (quotation.pdfFileId) {
-    // Supprimer le fichier PDF de la base de données
-    await this.storageService.delete(quotation.pdfFileId);
-
-    // Mettre à jour le devis pour retirer l'ID du fichier PDF
-    await this.expensequotationRepository.save({
-      ...quotation,
-      pdfFileId: null,
-      uploadPdfField: null,
-    });
-  }
-}
-async updateQuotationStatusIfExpired(quotationId: number): Promise<ExpensQuotationEntity> {
+  async updateQuotationStatusIfExpired(quotationId: number): Promise<ExpensQuotationEntity> {
     const quotation = await this.findOneById(quotationId);
     const currentDate = new Date();
     const dueDate = new Date(quotation.dueDate);
@@ -833,7 +745,7 @@ async updateQuotationStatusIfExpired(quotationId: number): Promise<ExpensQuotati
     });
 
     return !!existingQuotation;
-}
+  }
 
  
 

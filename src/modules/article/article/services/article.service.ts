@@ -1,4 +1,3 @@
-
 import { Injectable, BadRequestException, NotFoundException, ConflictException, InternalServerErrorException, ForbiddenException } from '@nestjs/common';
 import { PageDto } from 'src/common/database/dtos/database.page.dto';
 import { PageMetaDto } from 'src/common/database/dtos/database.page-meta.dto';
@@ -112,42 +111,7 @@ async unarchiveArticle(id: number): Promise<ArticleEntity> {
     };
   }
 
-async delete(id: number): Promise<ArticleEntity> {
-    // 1. Vérifier que l'article existe
-    const article = await this.findOneById(id);
-    
-    // 2. Vérifier les permissions de suppression
-    this.permissionService.validateAction(article.status, ArticleAction.DELETE);
 
-    // 3. Effectuer un soft delete
-    await this.articleRepository.softDelete(id);
-
-    // 4. Mettre à jour le statut
-    article.status = 'deleted';
-    article.deletedAt = new Date();
-    
-    // 5. Enregistrer les modifications
-    const deletedArticle = await this.articleRepository.save(article);
-
-    // 6. Créer une entrée d'historique
-    await this.articleHistoryService.createHistoryEntry({
-      version: article.version + 1,
-      changes: {
-        status: {
-          oldValue: article.status,
-          newValue: 'deleted'
-        },
-        deletedAt: {
-          oldValue: null,
-          newValue: new Date()
-        }
-      },
-      articleId: id,
-      snapshot: article
-    });
-
-    return deletedArticle;
-  }
 
   async getTopValuedArticles(): Promise<Array<{
     reference: string;
@@ -903,95 +867,105 @@ async findOneByReference(reference: string): Promise<ArticleEntity | null> {
   }
 
   async getSimpleStats() {
-    const allArticles = await this.articleRepository.find();
+    const allArticles = await this.articleRepository.find({
+      where: { deletedAt: null }
+    });
+    
+    const totalValue = allArticles.reduce((sum, a) => {
+      const quantity = Number(a.quantityInStock) || 0;
+      const price = Number(a.unitPrice) || 0;
+      return sum + (quantity * price);
+    }, 0);
     
     const stats = {
       totalArticles: allArticles.length,
       statusCounts: {},
       statusPercentages: {},
       outOfStockCount: allArticles.filter(a => 
-        a.status === 'out_of_stock' || a.quantityInStock <= 0
+        a.status === 'out_of_stock' || Number(a.quantityInStock) <= 0
       ).length,
-      totalStockValue: allArticles.reduce((sum, a) => sum + (a.quantityInStock * Number(a.unitPrice)), 0),
-      averageStockPerArticle: 0,
+      totalValue: totalValue,
+      averageStockPerArticle: allArticles.length > 0 ? totalValue / allArticles.length : 0,
       lowStockCount: allArticles.filter(a => 
-        a.quantityInStock > 0 && a.quantityInStock <= 5
+        Number(a.quantityInStock) > 0 && Number(a.quantityInStock) <= 5
       ).length,
-      topStockValueArticles: [] as Array<{
-        reference: string;
-        title: string;
-        value: number;
-        status: string;
-      }>,
-      toArchiveSuggestions: [] as string[],
-      stockHealth: {
-        activeWithStock: allArticles.filter(a => 
-          a.status === 'active' && a.quantityInStock > 0
-        ).length,
-        inactiveWithStock: allArticles.filter(a => 
-          a.status !== 'active' && a.quantityInStock > 0
-        ).length
-      }
+      topStockValueArticles: allArticles
+        .filter(a => Number(a.quantityInStock) > 0)
+        .map(a => ({
+          reference: a.reference,
+          title: a.title || 'Sans titre',
+          value: Number(a.quantityInStock) * Number(a.unitPrice),
+          status: a.status
+        }))
+        .sort((a, b) => b.value - a.value)
+        .slice(0, 5)
     };
 
+    // Calcul des comptages par statut
     allArticles.forEach(article => {
       stats.statusCounts[article.status] = (stats.statusCounts[article.status] || 0) + 1;
     });
 
+    // Calcul des pourcentages par statut
     for (const status in stats.statusCounts) {
       stats.statusPercentages[status] = 
         ((stats.statusCounts[status] / stats.totalArticles) * 100).toFixed(2) + '%';
     }
 
-    stats.averageStockPerArticle = stats.totalArticles > 0 
-      ? stats.totalStockValue / stats.totalArticles 
-      : 0;
-
-    stats.topStockValueArticles = allArticles
-      .filter(a => a.quantityInStock > 0)
-      .map(a => ({
-        reference: a.reference,
-        title: a.title || 'Sans titre',
-        value: a.quantityInStock * Number(a.unitPrice),
-        status: a.status
-      }))
-      .sort((a, b) => b.value - a.value)
-      .slice(0, 5);
-
-    const sixMonthsAgo = new Date();
-    sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
-    
-    stats.toArchiveSuggestions = allArticles
-      .filter(a => a.status === 'inactive' && a.updatedAt < sixMonthsAgo)
-      .map(a => a.reference);
-
     return stats;
   }
 
   async getStockAlerts() {
-    const allArticles = await this.articleRepository.find();
-    
+    const articles = await this.articleRepository.find({
+      where: { deletedAt: null }
+    });
+
+    const now = new Date();
+    const outOfStock = articles
+      .filter(article => Number(article.quantityInStock) <= 0)
+      .map(article => {
+        const lastStockDate = article.history
+          ?.filter(h => h.changes?.quantityInStock)
+          .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())[0]?.date;
+
+        const daysWithoutStock = lastStockDate 
+          ? Math.floor((now.getTime() - new Date(lastStockDate).getTime()) / (1000 * 60 * 60 * 24))
+          : 0;
+
+        return {
+          id: article.id,
+          reference: article.reference,
+          title: article.title || 'Sans titre',
+          status: 'Rupture',
+          daysWithoutStock: daysWithoutStock,
+          lastStockDate: lastStockDate
+        };
+      });
+
+    const lowStock = articles
+      .filter(article => {
+        const quantity = Number(article.quantityInStock);
+        return quantity > 0 && quantity <= 5;
+      })
+      .map(article => ({
+        id: article.id,
+        reference: article.reference,
+        title: article.title || 'Sans titre',
+        remainingQuantity: Number(article.quantityInStock),
+        criticalThreshold: 5,
+        unitPrice: Number(article.unitPrice)
+      }));
+
     return {
-      outOfStock: allArticles
-        .filter(a => a.quantityInStock === 0)
-        .map(a => ({
-          reference: a.reference,
-          title: a.title,
-          daysOutOfStock: Math.floor((new Date().getTime() - a.updatedAt.getTime()) / (1000 * 3600 * 24))
-        })),
-      
-      lowStock: allArticles
-        .filter(a => a.quantityInStock > 0 && a.quantityInStock <= 5)
-        .map(a => ({
-          reference: a.reference,
-          title: a.title,
-          remainingStock: a.quantityInStock
-        }))
+      outOfStock: outOfStock.sort((a, b) => b.daysWithoutStock - a.daysWithoutStock),
+      lowStock: lowStock.sort((a, b) => a.remainingQuantity - b.remainingQuantity)
     };
   }
 
   async getStatusOverview() {
-    const allArticles = await this.articleRepository.find();
+    const allArticles = await this.articleRepository.find({
+      where: { deletedAt: null }
+    });
     
     const counts = {
       draft: 0,
@@ -1015,7 +989,7 @@ async findOneByReference(reference: string): Promise<ArticleEntity | null> {
       if (examples[article.status].length < 2) {
         examples[article.status].push({
           reference: article.reference,
-          title: article.title
+          title: article.title || 'Sans titre'
         });
       }
     });
@@ -1031,136 +1005,26 @@ async findOneByReference(reference: string): Promise<ArticleEntity | null> {
     };
   }
 
-  async getArticleQualityScores(): Promise<{
-    scores: Array<{
-      id: number;
-      reference: string;
-      title?: string;
-      score: number;
-      missingFields: string[];
-    }>;
-    incompleteArticles: Array<{
-      id: number;
-      reference: string;
-      title?: string;
-      score: number;
-    }>;
-  }> {
-    const allArticles = await this.articleRepository.find();
-    
-    const results = allArticles.map(article => {
-      const missingFields = [];
-      let score = 0;
-
-      if (article.description) score += 25; else missingFields.push('description');
-      if (article.justificatifFile) score += 25; else missingFields.push('justificatif');
-      if (article.notes) score += 25; else missingFields.push('notes');
-      if (article.quantityInStock > 0) score += 25; else missingFields.push('stock');
-
-      return {
-        id: article.id,
-        reference: article.reference,
-        title: article.title,
-        score,
-        missingFields
-      };
-    });
-
-    return {
-      scores: results,
-      incompleteArticles: results
-        .filter(item => item.score < 100)
-        .sort((a, b) => a.score - b.score)
-    };
-  }
-
-  async detectSuspiciousArticles(): Promise<{
-    zeroPrice: Array<{ id: number; reference: string; title?: string }>;
-    highStock: Array<{ id: number; reference: string; title?: string; quantity: number }>;
-    invalidReference: Array<{ id: number; reference: string; title?: string }>;
-  }> {
-    const allArticles = await this.articleRepository.find();
-    const referenceRegex = /^[A-Z0-9]{3,}-[0-9]{3,}$/;
-
-    return {
-      zeroPrice: allArticles
-        .filter(a => a.unitPrice === 0)
-        .map(a => ({ id: a.id, reference: a.reference, title: a.title })),
-
-      highStock: allArticles
-        .filter(a => a.quantityInStock > 10000)
-        .map(a => ({ 
-          id: a.id, 
-          reference: a.reference, 
-          title: a.title, 
-          quantity: a.quantityInStock 
-        })),
-
-      invalidReference: allArticles
-        .filter(a => !referenceRegex.test(a.reference))
-        .map(a => ({ id: a.id, reference: a.reference, title: a.title }))
-    };
-  }
-
-  async comparePriceTrends(): Promise<{
-    oldArticles: {
-      count: number;
-      averagePrice: number;
-    };
-    newArticles: {
-      count: number;
-      averagePrice: number;
-    };
-    priceEvolution: {
-      amount: number;
-      percentage: number;
-      trend: 'up' | 'down' | 'stable';
-    };
-  }> {
-    const oneYearAgo = new Date();
-    oneYearAgo.setFullYear(oneYearAgo.getFullYear() - 1);
-
-    const allArticles = await this.articleRepository.find();
-    
-    const oldArticles = allArticles.filter(a => a.createdAt < oneYearAgo);
-    const newArticles = allArticles.filter(a => a.createdAt >= oneYearAgo);
-
-    const avgOld = oldArticles.reduce((sum, a) => sum + a.unitPrice, 0) / (oldArticles.length || 1);
-    const avgNew = newArticles.reduce((sum, a) => sum + a.unitPrice, 0) / (newArticles.length || 1);
-
-    const amountDiff = avgNew - avgOld;
-    const percentDiff = (amountDiff / avgOld) * 100;
-
-    return {
-      oldArticles: {
-        count: oldArticles.length,
-        averagePrice: parseFloat(avgOld.toFixed(2))
-      },
-      newArticles: {
-        count: newArticles.length,
-        averagePrice: parseFloat(avgNew.toFixed(2))
-      },
-      priceEvolution: {
-        amount: parseFloat(amountDiff.toFixed(2)),
-        percentage: parseFloat(percentDiff.toFixed(2)),
-        trend: amountDiff > 0 ? 'up' : amountDiff < 0 ? 'down' : 'stable'
-      }
-    };
-  }
-
   async getStockHealth(): Promise<{
     activePercentage: number;
     status: 'poor' | 'medium' | 'good';
     details: Record<string, number>;
   }> {
-    const allArticles = await this.articleRepository.find();
+    const allArticles = await this.articleRepository.find({
+      where: { deletedAt: null }
+    });
+    
     const statusCounts = {};
+    let activeCount = 0;
 
     allArticles.forEach(a => {
       statusCounts[a.status] = (statusCounts[a.status] || 0) + 1;
+      if (a.status === 'active') {
+        activeCount++;
+      }
     });
 
-    const activePercentage = (statusCounts['active'] || 0) / allArticles.length * 100;
+    const activePercentage = (activeCount / allArticles.length) * 100;
 
     return {
       activePercentage: parseFloat(activePercentage.toFixed(2)),
@@ -1291,4 +1155,200 @@ async findOneByReference(reference: string): Promise<ArticleEntity | null> {
     return [];
   }
 }
+
+
+async delete(id: number): Promise<ArticleEntity> {
+    // 1. Trouver l'article existant
+    const article = await this.findOneById(id);
+    
+    // 2. Vérifier que l'article n'est pas déjà supprimé
+    if (article.status === 'deleted') {
+        throw new BadRequestException('Cet article est déjà marqué comme supprimé');
+    }
+
+    // 3. Vérifier les permissions de suppression
+    this.permissionService.validateAction(article.status, ArticleAction.DELETE);
+
+    // 4. Sauvegarder l'ancien statut pour l'historique
+    const previousStatus = article.status;
+
+    // 5. Mettre à jour le statut et la date de suppression
+    article.status = 'deleted';
+    article.deletedAt = new Date();
+    article.version += 1;
+    
+    // 6. Enregistrer les modifications (cela fera aussi le soft delete)
+    const deletedArticle = await this.articleRepository.save(article);
+
+    // 7. Créer une entrée d'historique
+    await this.articleHistoryService.createHistoryEntry({
+        version: deletedArticle.version,
+        changes: {
+            status: {
+                oldValue: previousStatus,
+                newValue: 'deleted'
+            },
+            deletedAt: {
+                oldValue: null,
+                newValue: deletedArticle.deletedAt
+            }
+        },
+        articleId: id,
+        snapshot: article
+    });
+
+    return deletedArticle;
+}
+
+async markAsDeleted(id: number): Promise<ArticleEntity> {
+  const article = await this.findOneById(id);
+  
+  if (article.status === 'deleted') {
+    throw new BadRequestException('Cet article est déjà marqué comme supprimé');
+  }
+
+  const previousStatus = article.status;
+  article.status = 'deleted';
+  article.deletedAt = new Date();
+  article.version += 1;
+
+  const updatedArticle = await this.articleRepository.save(article);
+
+  await this.articleHistoryService.createHistoryEntry({
+    version: updatedArticle.version,
+    changes: {
+      status: {
+        oldValue: previousStatus,
+        newValue: 'deleted'
+      },
+      deletedAt: {
+        oldValue: null,
+        newValue: updatedArticle.deletedAt
+      }
+    },
+    articleId: id,
+    snapshot: article
+  });
+
+  return updatedArticle;
+}
+
+// Ajout des méthodes pour les stats avancées
+async getArticleQualityScores(): Promise<{
+  scores: Array<{
+    id: number;
+    reference: string;
+    title?: string;
+    score: number;
+    missingFields: string[];
+  }>;
+  incompleteArticles: Array<{
+    id: number;
+    reference: string;
+    title?: string;
+    score: number;
+  }>;
+}> {
+  const allArticles = await this.articleRepository.find({ where: { deletedAt: null } });
+  
+  const results = allArticles.map(article => {
+    const missingFields = [];
+    let score = 0;
+
+    if (article.description) score += 25; else missingFields.push('description');
+    if (article.justificatifFile) score += 25; else missingFields.push('justificatif');
+    if (article.notes) score += 25; else missingFields.push('notes');
+    if (Number(article.quantityInStock) > 0) score += 25; else missingFields.push('stock');
+
+    return {
+      id: article.id,
+      reference: article.reference,
+      title: article.title,
+      score,
+      missingFields
+    };
+  });
+
+  return {
+    scores: results,
+    incompleteArticles: results
+      .filter(item => item.score < 100)
+      .sort((a, b) => a.score - b.score)
+  };
+}
+
+async detectSuspiciousArticles(): Promise<{
+  zeroPrice: Array<{ id: number; reference: string; title?: string }>;
+  highStock: Array<{ id: number; reference: string; title?: string; quantity: number }>;
+  invalidReference: Array<{ id: number; reference: string; title?: string }>;
+}> {
+  const allArticles = await this.articleRepository.find({ where: { deletedAt: null } });
+  const referenceRegex = /^[A-Z0-9]{3,}-[0-9]{3,}$/;
+
+  return {
+    zeroPrice: allArticles
+      .filter(a => Number(a.unitPrice) === 0)
+      .map(a => ({ id: a.id, reference: a.reference, title: a.title })),
+
+    highStock: allArticles
+      .filter(a => Number(a.quantityInStock) > 10000)
+      .map(a => ({ 
+        id: a.id, 
+        reference: a.reference, 
+        title: a.title, 
+        quantity: Number(a.quantityInStock) 
+      })),
+
+    invalidReference: allArticles
+      .filter(a => !referenceRegex.test(a.reference))
+      .map(a => ({ id: a.id, reference: a.reference, title: a.title }))
+  };
+}
+
+async comparePriceTrends(): Promise<{
+  oldArticles: {
+    count: number;
+    averagePrice: number;
+  };
+  newArticles: {
+    count: number;
+    averagePrice: number;
+  };
+  priceEvolution: {
+    amount: number;
+    percentage: number;
+    trend: 'up' | 'down' | 'stable';
+  };
+}> {
+  const oneYearAgo = new Date();
+  oneYearAgo.setFullYear(oneYearAgo.getFullYear() - 1);
+
+  const allArticles = await this.articleRepository.find({ where: { deletedAt: null } });
+  
+  const oldArticles = allArticles.filter(a => a.createdAt < oneYearAgo);
+  const newArticles = allArticles.filter(a => a.createdAt >= oneYearAgo);
+
+  const avgOld = oldArticles.reduce((sum, a) => sum + Number(a.unitPrice), 0) / (oldArticles.length || 1);
+  const avgNew = newArticles.reduce((sum, a) => sum + Number(a.unitPrice), 0) / (newArticles.length || 1);
+
+  const amountDiff = avgNew - avgOld;
+  const percentDiff = avgOld !== 0 ? (amountDiff / avgOld) * 100 : 0;
+
+  return {
+    oldArticles: {
+      count: oldArticles.length,
+      averagePrice: parseFloat(avgOld.toFixed(2))
+    },
+    newArticles: {
+      count: newArticles.length,
+      averagePrice: parseFloat(avgNew.toFixed(2))
+    },
+    priceEvolution: {
+      amount: parseFloat(amountDiff.toFixed(2)),
+      percentage: parseFloat(percentDiff.toFixed(2)),
+      trend: amountDiff > 0 ? 'up' : amountDiff < 0 ? 'down' : 'stable'
+    }
+  };
+}
+
 }

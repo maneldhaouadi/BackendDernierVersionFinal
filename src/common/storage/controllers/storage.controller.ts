@@ -69,11 +69,38 @@ export class StorageController {
     },
   })
   @Post('upload')
-  @UseInterceptors(FileInterceptor('file'))
+  @UseInterceptors(FileInterceptor('file', {
+    limits: {
+      fileSize: 10 * 1024 * 1024, // 10MB max file size
+    },
+  }))
   async uploadFile(
     @UploadedFile() file: Express.Multer.File,
   ): Promise<UploadEntity> {
-    return this.storageService.store(file);
+    try {
+      console.log('Received file upload request:', {
+        filename: file?.originalname,
+        size: file?.size,
+        mimetype: file?.mimetype
+      });
+
+      if (!file) {
+        console.error('No file received in request');
+        throw new Error('No file received');
+      }
+
+      const result = await this.storageService.store(file);
+      console.log('File stored successfully:', {
+        id: result.id,
+        filename: result.filename,
+        slug: result.slug
+      });
+
+      return result;
+    } catch (error) {
+      console.error('Error uploading file:', error);
+      throw error;
+    }
   }
 
   @Get('/file/slug/:slug')

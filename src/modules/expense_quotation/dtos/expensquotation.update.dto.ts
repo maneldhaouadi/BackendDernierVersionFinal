@@ -11,15 +11,7 @@ export class UpdateExpensQuotationDto extends CreateExpensQuotationDto {
 
   @ApiProperty({ required: false })
   @IsOptional()
-  uploads?: UpdateExpensQuotationUploadDto[];
-
-  @ApiProperty({ required: false })
-  @IsOptional()
-  createInvoice: boolean;
-
-  @IsOptional()
   @IsString()
   @MaxLength(25)
   sequentialNumbr?: string;
-
 }

@@ -48,41 +48,72 @@ export class StorageService {
   }
 
   async store(file: Express.Multer.File): Promise<UploadEntity> {
-    const slug = uuidv4();
-    const filename = file.originalname;
-    const mimetype = file.mimetype;
-    const size = file.size;
-
-    const extension = mime.extension(mimetype) || '';
-    let relativePath = slug;
-
-    if (extension) {
-      relativePath = `${slug}.${extension}`;
-    }
-
-    const upload = this.uploadRepository.save({
-      slug,
-      filename,
-      mimetype,
-      size,
-      relativePath,
-    });
-
-    const destinationFile = join(this.rootLocation, relativePath);
     try {
-      if (!file.buffer || file.buffer.length === 0) {
-        throw new StorageBadRequestException('Failed to store empty file.');
+      console.log('Starting file storage process:', {
+        originalname: file.originalname,
+        size: file.size,
+        mimetype: file.mimetype
+      });
+
+      if (!file || !file.buffer || file.buffer.length === 0) {
+        console.error('Invalid file received:', file);
+        throw new StorageBadRequestException('Invalid or empty file received');
       }
+
+      const slug = uuidv4();
+      const filename = file.originalname;
+      const mimetype = file.mimetype;
+      const size = file.size;
+
+      const extension = mime.extension(mimetype) || '';
+      let relativePath = slug;
+
+      if (extension) {
+        relativePath = `${slug}.${extension}`;
+      }
+
+      console.log('Creating upload record:', {
+        slug,
+        filename,
+        mimetype,
+        size,
+        relativePath
+      });
+
+      const upload = await this.uploadRepository.save({
+        slug,
+        filename,
+        mimetype,
+        size,
+        relativePath,
+      });
+
+      const destinationFile = join(this.rootLocation, relativePath);
+      
+      console.log('Writing file to disk:', {
+        destination: destinationFile,
+        bufferSize: file.buffer.length
+      });
 
       await fs.mkdir(this.rootLocation, { recursive: true });
       await fs.writeFile(destinationFile, file.buffer);
+
+      console.log('File stored successfully:', {
+        id: upload.id,
+        slug: upload.slug,
+        path: destinationFile
+      });
+
+      return upload;
     } catch (error) {
+      console.error('Error storing file:', {
+        error: error.message,
+        stack: error.stack
+      });
       throw new StorageBadRequestException(
-        'Failed to store file : ' + error.message,
+        'Failed to store file: ' + error.message
       );
     }
-
-    return upload;
   }
 
   async storeMultipleFiles(files: Express.Multer.File[]) {

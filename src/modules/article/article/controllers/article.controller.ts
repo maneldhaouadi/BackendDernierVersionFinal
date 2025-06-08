@@ -1,4 +1,3 @@
-
 import {
   Body,
   Controller,
@@ -55,21 +54,6 @@ export class ArticleController {
 
   ) {}
 
-
-  @Delete(':id')
-@ApiOperation({ summary: 'Soft delete an article (mark as deleted)' })
-@ApiParam({ name: 'id', description: 'Article ID to delete', type: Number })
-@ApiResponse({ 
-  status: 200, 
-  description: 'Article successfully marked as deleted',
-  type: ResponseArticleDto
-})
-async delete(
-  @Param('id', ParseIntPipe) id: number
-): Promise<ResponseArticleDto> {
-  const deletedArticle = await this.articleService.delete(id);
-  return this.mapToResponseDto(deletedArticle);
-}
 
   @Get('active')
   @ApiOperation({ summary: 'Get all active (non-archived) articles' })
@@ -300,6 +284,8 @@ async bulkUpdateStatus(
     return this.articleService.getStatusOverview();
   }
 
+
+
   //fin stats 
 
 
@@ -528,6 +514,25 @@ async getStockValueEvolution(
     const updatedArticle = await this.articleService.updateArticleStock(id, quantityChange);
     return this.mapToResponseDto(updatedArticle);
   }
+
+  @Delete('/delete/:id')
+@ApiOperation({ summary: 'Soft delete an article (mark as deleted)' })
+@ApiParam({ name: 'id', description: 'Article ID to delete', type: Number })
+@ApiResponse({ 
+    status: 200, 
+    description: 'Article successfully marked as deleted',
+    type: ResponseArticleDto
+})
+async delete(
+    @Param('id', ParseIntPipe) id: number
+): Promise<{ success: boolean; deletedArticle: ResponseArticleDto; message: string }> {
+    const deletedArticle = await this.articleService.delete(id);
+    return {
+      success: true,
+      deletedArticle: this.mapToResponseDto(deletedArticle),
+      message: 'Article marqué comme supprimé avec succès'
+    };
+}
  /* @Post('create-from-image')
   @UseInterceptors(FileInterceptor('file', {
     storage: diskStorage({

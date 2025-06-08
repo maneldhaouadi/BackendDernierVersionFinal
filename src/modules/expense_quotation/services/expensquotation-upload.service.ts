@@ -154,8 +154,14 @@ export class ExpensQuotationUploadService {
   }): Promise<ExpensQuotationUploadEntity> {
     // Validation des données requises
     if (!createDto.expensequotationId || !createDto.uploadId) {
+      console.error('Missing required fields:', createDto);
       throw new Error('expensequotationId and uploadId are required');
     }
+
+    console.log('Creating upload association:', {
+      expensequotationId: createDto.expensequotationId,
+      uploadId: createDto.uploadId
+    });
 
     const newUpload = this.quotationUploadRepository.create({
       expensequotationId: createDto.expensequotationId,
@@ -168,8 +174,15 @@ export class ExpensQuotationUploadService {
     
     // Vérification que l'enregistrement a bien été créé
     if (!savedUpload.id) {
+      console.error('Failed to create upload record:', savedUpload);
       throw new Error('Failed to create upload record');
     }
+
+    console.log('Upload association created successfully:', {
+      id: savedUpload.id,
+      expensequotationId: savedUpload.expensequotationId,
+      uploadId: savedUpload.uploadId
+    });
     
     return savedUpload;
   }

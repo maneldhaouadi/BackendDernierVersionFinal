@@ -13,9 +13,9 @@ import {
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { diskStorage } from 'multer';
-import { extname } from 'path';
+import { extname, join } from 'path';
 import * as crypto from 'crypto';
-import { existsSync, unlinkSync } from 'fs';
+import { existsSync, mkdirSync } from 'fs';
 import {
   ApiTags,
   ApiOperation,
@@ -32,8 +32,14 @@ import { ArticleOcrService } from '../services/articleOcrService';
 @Controller('ocr')
 export class ArticleOcrController {
   private readonly logger = new Logger(ArticleOcrController.name);
+  private readonly uploadDir = './uploads/ocr';
   
-  constructor(private readonly ocrService: ArticleOcrService) {}
+  constructor(private readonly ocrService: ArticleOcrService) {
+    // Créer le dossier d'upload s'il n'existe pas
+    if (!existsSync(this.uploadDir)) {
+      mkdirSync(this.uploadDir, { recursive: true });
+    }
+  }
 
   @Post('process')
   @UseInterceptors(
@@ -125,11 +131,13 @@ export class ArticleOcrController {
         throw new HttpException('No file uploaded', HttpStatus.BAD_REQUEST);
       }
 
-      if (!existsSync(file.path)) {
+      const filePath = join(this.uploadDir, file.filename);
+      if (!existsSync(filePath)) {
         throw new HttpException('File not found', HttpStatus.BAD_REQUEST);
       }
 
-      const result = await this.ocrService.processDocument(file.path, debugMode);
+      this.logger.debug(`Processing file: ${filePath}`);
+      const result = await this.ocrService.processDocument(filePath, debugMode);
 
       if (strictMode && result.confidence < 85) {
         throw new HttpException(
@@ -138,11 +146,18 @@ export class ArticleOcrController {
         );
       }
 
+      // Nettoyage du fichier après traitement
+      await this.cleanupFile(file.filename);
+
       return result;
     } catch (error) {
       this.logger.error(`OCR processing failed: ${error.message}`, error.stack);
-      if (file?.path && existsSync(file.path)) {
-        this.ocrService.cleanupFile(file.path);
+      
+      // Nettoyage en cas d'erreur
+      if (file?.filename) {
+        await this.cleanupFile(file.filename).catch(err => 
+          this.logger.error(`Failed to cleanup file: ${err.message}`)
+        );
       }
 
       throw new HttpException(
@@ -153,10 +168,6 @@ export class ArticleOcrController {
         },
         error.status || HttpStatus.INTERNAL_SERVER_ERROR,
       );
-    } finally {
-      if (file?.path && existsSync(file.path)) {
-        this.ocrService.cleanupFile(file.path);
-      }
     }
   }
 
@@ -216,15 +227,13 @@ export class ArticleOcrController {
     description: 'File not found',
   })
   async cleanupFile(@Param('filename') filename: string) {
-    const filePath = `./uploads/ocr/${filename}`;
-    if (!existsSync(filePath)) {
-      throw new HttpException('File not found', HttpStatus.NOT_FOUND);
-    }
-
+    const filePath = join(this.uploadDir, filename);
+    
     try {
-      this.ocrService.cleanupFile(filePath);
+      await this.ocrService.cleanupFile(filePath);
       return { success: true, message: 'File deleted successfully' };
     } catch (error) {
+      this.logger.error(`Failed to delete file ${filename}: ${error.message}`);
       throw new HttpException(
         'Failed to delete file',
         HttpStatus.INTERNAL_SERVER_ERROR,

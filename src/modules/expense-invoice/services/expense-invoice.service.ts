@@ -33,16 +33,12 @@ import { TemplateType } from "src/modules/template/enums/TemplateType";
 import ejs from "ejs";
 import { ExpenseArticleInvoiceEntryEntity } from "../repositories/entities/expense-article-invoice-entry.entity";
 import { ArticleEntity } from "src/modules/article/article/repositories/entities/article.entity";
-import { ExpenseUpdateInvoiceUploadDto } from "../dtos/expense-invoice-upload.update.dto";
-import { ExpenseInvoiceUploadEntity } from "../repositories/entities/expense-invoice-file.entity";
-import { ExpenseInvoiceUploadRepository } from "../repositories/repository/expense-invoice-upload.repository";
 
 @Injectable()
 export class ExpenseInvoiceService {
   constructor(
     //repositories
     private readonly invoiceRepository: ExpenseInvoiceRepository,
-    private readonly invoiceUploadRepository:ExpenseInvoiceUploadRepository,
     //entity services
     private readonly articleInvoiceEntryService: ExpenseArticleInvoiceEntryService,
     private readonly invoiceUploadService: ExpenseInvoiceUploadService,
@@ -274,21 +270,21 @@ private async generateSequentialNumber(): Promise<string> {
   return this.entityManager.transaction(async (transactionalEntityManager) => {
     const existingInvoice = await transactionalEntityManager.findOne(ExpenseInvoiceEntity, { 
       where: { id },
-      relations: ['articleExpenseEntries', 'articleExpenseEntries.article'],
+      relations: ['articleExpenseEntries', 'articleExpenseEntries.article', 'uploads','uploads.upload'],
     });
 
     if (!existingInvoice) {
       throw new NotFoundException('Invoice not found');
     }
 
-    // Gestion des uploads
-    const existingUploadEntities = await this.invoiceUploadService.findByInvoiceId(id);
+    // Gestion des uploads - cette partie ne supprime plus les anciens fichiers
+    const existingUploadEntities = existingInvoice.uploads || [];
     const existingUploads = existingUploadEntities.map(upload => ({
       id: upload.id,
       uploadId: upload.uploadId,
     }));
 
-    const { keptUploads, newUploads, eliminatedUploads } = await this.updateExpenseInvoiceUpload(
+    const { keptUploads, newUploads } = await this.updateExpenseInvoiceUpload(
       id,
       updateInvoiceDto,
       existingUploads,
@@ -433,37 +429,58 @@ private async generateSequentialNumber(): Promise<string> {
   });
 }
   
-  async updateExpenseInvoiceUpload(
+async updateExpenseInvoiceUpload(
   id: number,
   updateInvoiceDto: ExpenseUpdateInvoiceDto,
   existingUploads: ExpenseResponseInvoiceUploadDto[],
 ) {
-  // 1. Identifier les uploads à conserver et à supprimer
-  const keptUploadIds = (updateInvoiceDto.uploads || []).map(u => u.uploadId);
-  const uploadsToDelete = existingUploads.filter(u => !keptUploadIds.includes(u.uploadId));
-  
-  // 2. Supprimer seulement les uploads qui ne sont plus nécessaires
-  if (uploadsToDelete.length > 0) {
-    await this.invoiceUploadService.softDeleteMany(
-      uploadsToDelete.map(u => ({ id: u.id } as ExpenseInvoiceUploadEntity))
-    );
+  const newUploads = [];
+  const keptUploads = [...existingUploads];
+  const eliminatedUploads = [];
+
+  if (!updateInvoiceDto.uploads) {
+    return { keptUploads, newUploads, eliminatedUploads };
   }
 
-  // 3. Ajouter uniquement les nouveaux uploads qui n'existent pas déjà
-  const existingUploadIds = existingUploads.map(u => u.uploadId);
-  const newUploads = await Promise.all(
-    (updateInvoiceDto.uploads || [])
-      .filter(upload => !existingUploadIds.includes(upload.uploadId))
-      .map(upload => this.invoiceUploadRepository.insertUnique(id, upload.uploadId))
-  );
+  // 1. Identifier tous les uploadIds dans la requête
+  const requestUploadIds = new Set(updateInvoiceDto.uploads.map(u => u.uploadId));
 
-  return {
-    keptUploads: existingUploads.filter(u => keptUploadIds.includes(u.uploadId)),
-    newUploads: newUploads.filter(Boolean),
-    eliminatedUploads: uploadsToDelete
+  // 2. Pour chaque upload dans la requête
+  for (const upload of updateInvoiceDto.uploads) {
+    // Vérifier si l'upload existe déjà dans la facture
+    const existingUpload = existingUploads.find(u => u.uploadId === upload.uploadId);
+    
+    if (!existingUpload) {
+      try {
+        // Si l'upload n'existe pas, l'ajouter
+        const newUpload = await this.invoiceUploadService.save(id, upload.uploadId);
+        newUploads.push({
+          id: newUpload.id,
+          uploadId: newUpload.uploadId,
+        });
+      } catch (error) {
+        console.error(`Échec de l'ajout du fichier ${upload.uploadId}:`, error);
+        throw error;
+      }
+    } else {
+      // Si l'upload existe mais n'est pas encore associé (expenseInvoiceId = NULL)
+      // On doit le mettre à jour
+      if (!existingUpload.id) {
+        const updatedUpload = await this.invoiceUploadService.save(id, upload.uploadId);
+        keptUploads.push({
+          id: updatedUpload.id,
+          uploadId: updatedUpload.uploadId,
+        });
+      }
+    }
+  }
+
+  return { 
+    keptUploads: [...keptUploads, ...newUploads],
+    newUploads,
+    eliminatedUploads
   };
 }
-  
 
 
   async updateFields(
